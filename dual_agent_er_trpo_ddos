@@ -1,0 +1,5386 @@
+import argparse
+import copy
+import json
+import math
+import random
+import subprocess
+import time
+import warnings
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import joblib
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from scipy.stats import t as student_t, ttest_rel
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+from torch.distributions import Categorical
+from torch.utils.data import DataLoader, TensorDataset
+
+
+KDD_COLUMNS = [
+    "duration", "protocol_type", "service", "flag", "src_bytes", "dst_bytes",
+    "land", "wrong_fragment", "urgent", "hot", "num_failed_logins", "logged_in",
+    "num_compromised", "root_shell", "su_attempted", "num_root",
+    "num_file_creations", "num_shells", "num_access_files", "num_outbound_cmds",
+    "is_host_login", "is_guest_login", "count", "srv_count", "serror_rate",
+    "srv_serror_rate", "rerror_rate", "srv_rerror_rate", "same_srv_rate",
+    "diff_srv_rate", "srv_diff_host_rate", "dst_host_count", "dst_host_srv_count",
+    "dst_host_same_srv_rate", "dst_host_diff_srv_rate",
+    "dst_host_same_src_port_rate", "dst_host_srv_diff_host_rate",
+    "dst_host_serror_rate", "dst_host_srv_serror_rate", "dst_host_rerror_rate",
+    "dst_host_srv_rerror_rate", "label",
+]
+
+
+@dataclass
+class FixedSettings:
+    clip_lower_quantile: float = 0.01
+    clip_upper_quantile: float = 0.99
+    initial_labeled_fraction: float = 0.10
+    lstm_hidden_size: int = 128
+    policy_hidden_size: int = 128
+    value_hidden_size: int = 128
+    gamma: float = 0.99
+    n_step: int = 5
+    kl_delta: float = 0.01
+    cg_iterations: int = 10
+    cg_damping: float = 0.10
+    line_search_steps: int = 10
+    line_search_backtrack: float = 0.5
+    value_iterations: int = 20
+    lime_num_samples: int = 512
+    lime_kernel_width: Optional[float] = None
+    epsilon: float = 1e-8
+    detector_update_epochs_after_annotation: int = 1
+    homotopy_stage_count: int = 5
+    bohb_iterations_per_stage: int = 3
+    bohb_eta: int = 3
+    bohb_min_budget: int = 10
+    bohb_max_budget: int = 90
+    validation_reward_max_samples: Optional[int] = None
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+PAPER_SEARCH_SPACE = {
+    "batch_size": (32, 1024),
+    "learning_rate": (1e-4, 5e-2),
+    "activation": ["Leaky ReLU", "ReLU", "Tanh", "Linear", "Sigmoid"],
+    "dropout": (0.0, 0.7),
+    "training_epochs": (16, 1024),
+    "lstm_layers": (1, 8),
+    "mlp_layers": (1, 8),
+    "affinity_temperature": (0.1, 2.0),
+    "annotation_cost": (0.0, 1.0),
+    "skip_reward": (0.0, 1.0),
+    "initial_uncertainty_threshold": (0.1, 1.0),
+    "threshold_decay": (1e-4, 0.1),
+    "annotation_budget": (100, 5000),
+    "feature_relevance_weight": (0.0, 1.0),
+    "subset_complexity_weight": (0.0, 1.0),
+    "validation_improvement_weight": (0.0, 1.0),
+    "entropy_coefficient": (1e-4, 0.1),
+}
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception as exc:
+        warnings.warn(
+            f"Could not enable deterministic PyTorch algorithms: {exc}",
+            RuntimeWarning,
+        )
+
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def activation_module(name: str) -> nn.Module:
+    key = name.strip().lower()
+
+    if key == "relu":
+        return nn.ReLU()
+
+    if key == "leaky relu":
+        return nn.LeakyReLU(0.01)
+
+    if key == "tanh":
+        return nn.Tanh()
+
+    if key == "linear":
+        return nn.Identity()
+
+    if key == "sigmoid":
+        return nn.Sigmoid()
+
+    raise ValueError(f"Unsupported activation: {name}")
+
+
+def clone_activation(name: str) -> nn.Module:
+    return copy.deepcopy(activation_module(name))
+
+
+def json_safe(obj):
+    if isinstance(obj, dict):
+        return {
+            str(k): json_safe(v)
+            for k, v in obj.items()
+        }
+
+    if isinstance(obj, (list, tuple)):
+        return [
+            json_safe(v)
+            for v in obj
+        ]
+
+    if isinstance(obj, np.generic):
+        return obj.item()
+
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+
+    if isinstance(obj, Path):
+        return str(obj)
+
+    return obj
+
+
+def run_cicflowmeter_if_needed(
+    data_path: Path,
+    command_template: Optional[str],
+    output_dir: Path,
+) -> Path:
+    pcap_files = []
+
+    if data_path.is_file() and data_path.suffix.lower() in {
+        ".pcap",
+        ".pcapng",
+    }:
+        pcap_files = [data_path]
+
+    elif data_path.is_dir():
+        pcap_files = (
+            list(data_path.rglob("*.pcap"))
+            + list(data_path.rglob("*.pcapng"))
+        )
+
+    if not pcap_files:
+        return data_path
+
+    if not command_template:
+        raise ValueError(
+            "PCAP input requires --cicflowmeter-command. "
+            "Provide a command template containing {input} and {output}; "
+            "the paper used CICFlowMeter 4.0 to align flow formats."
+        )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    for pcap in pcap_files:
+        out_csv = output_dir / f"{pcap.stem}.csv"
+
+        command = command_template.format(
+            input=str(pcap),
+            output=str(out_csv),
+        )
+
+        subprocess.run(
+            command,
+            shell=True,
+            check=True,
+        )
+
+    return output_dir
+
+
+def read_one_table(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+
+    if suffix in {
+        ".csv",
+        ".data",
+        ".txt",
+        ".corrected",
+        "",
+    }:
+        if suffix in {
+            ".data",
+            ".corrected",
+        }:
+            df = pd.read_csv(
+                path,
+                header=None,
+            )
+
+        else:
+            try:
+                df = pd.read_csv(path)
+
+            except Exception:
+                df = pd.read_csv(
+                    path,
+                    header=None,
+                )
+
+        normalized_columns = {
+            str(c).strip().lower()
+            for c in df.columns
+        }
+
+        if (
+            df.shape[1] == 42
+            and "label" not in normalized_columns
+        ):
+         
+            if not all(
+                isinstance(c, (int, np.integer))
+                for c in df.columns
+            ):
+                first_name = str(
+                    df.columns[0]
+                ).strip()
+
+                looks_like_kdd_headerless = (
+                    first_name.replace(
+                        ".",
+                        "",
+                        1,
+                    ).isdigit()
+                    or suffix in {
+                        ".data",
+                        ".corrected",
+                        "",
+                    }
+                )
+
+                if looks_like_kdd_headerless:
+                    df = pd.read_csv(
+                        path,
+                        header=None,
+                    )
+
+            if df.shape[1] == 42:
+                df.columns = KDD_COLUMNS
+
+        return df
+
+    if suffix in {
+        ".parquet",
+        ".pq",
+    }:
+        return pd.read_parquet(path)
+
+    if suffix == ".feather":
+        return pd.read_feather(path)
+
+    raise ValueError(
+        f"Unsupported tabular data format: {path}"
+    )
+
+
+def load_raw_dataset(
+    data_path: str,
+    max_rows: Optional[int] = None,
+) -> pd.DataFrame:
+    path = Path(data_path)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Dataset path does not exist: {path}"
+        )
+
+    if path.is_file():
+        df = read_one_table(path)
+
+    else:
+        files = sorted(
+            p
+            for p in path.rglob("*")
+            if (
+                p.is_file()
+                and p.suffix.lower()
+                in {
+                    ".csv",
+                    ".data",
+                    ".txt",
+                    ".corrected",
+                    "",
+                    ".parquet",
+                    ".pq",
+                    ".feather",
+                }
+            )
+        )
+
+        if not files:
+            raise FileNotFoundError(
+                f"No supported tabular files were found under: {path}"
+            )
+
+        frames = []
+        remaining = max_rows
+
+        for file_path in files:
+            part = read_one_table(
+                file_path
+            )
+
+            if remaining is not None:
+                part = part.iloc[
+                    :remaining
+                ]
+
+                remaining -= len(
+                    part
+                )
+
+            frames.append(
+                part
+            )
+
+            if (
+                remaining is not None
+                and remaining <= 0
+            ):
+                break
+
+        df = pd.concat(
+            frames,
+            axis=0,
+            ignore_index=True,
+        )
+
+    if max_rows is not None:
+        df = df.iloc[
+            :max_rows
+        ].copy()
+
+    return df
+
+
+def infer_label_column(
+    df: pd.DataFrame,
+    explicit: Optional[str],
+) -> str:
+    if explicit:
+        if explicit not in df.columns:
+            raise ValueError(
+                f"Label column '{explicit}' was not found."
+            )
+
+        return explicit
+
+    normalized = {
+        str(c).strip().lower(): c
+        for c in df.columns
+    }
+
+    candidates = [
+        "label",
+        "class",
+        "target",
+        "attack",
+        "attack_cat",
+        "attack category",
+        "category",
+        "result",
+        "tag",
+        "binary_label",
+        "is_attack",
+    ]
+
+    for candidate in candidates:
+        if candidate in normalized:
+            return normalized[
+                candidate
+            ]
+
+    if df.shape[1] == 42:
+        return df.columns[-1]
+
+    raise ValueError(
+        "Could not infer the label column. "
+        "Supply --label-column explicitly."
+    )
+
+
+def map_binary_labels(
+    series: pd.Series,
+) -> np.ndarray:
+    if pd.api.types.is_numeric_dtype(
+        series
+    ):
+        values = pd.to_numeric(
+            series,
+            errors="coerce",
+        )
+
+        unique = sorted(
+            v
+            for v in values.dropna().unique()
+        )
+
+        if set(unique).issubset(
+            {0, 1}
+        ):
+            return values.astype(
+                int
+            ).to_numpy()
+
+       
+        return (
+            values.to_numpy() != 0
+        ).astype(
+            np.int64
+        )
+
+    benign_tokens = {
+        "normal",
+        "normal.",
+        "benign",
+        "benign.",
+        "legitimate",
+        "legit",
+        "clean",
+        "non-attack",
+        "nonattack",
+        "0",
+        "false",
+        "no attack",
+        "no_attack",
+    }
+
+    text = (
+        series
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+
+    return (
+        ~text.isin(
+            benign_tokens
+        )
+    ).astype(
+        np.int64
+    ).to_numpy()
+
+
+def clean_dataset(
+    df: pd.DataFrame,
+    label_column: str,
+) -> Tuple[
+    pd.DataFrame,
+    np.ndarray,
+]:
+    df = df.copy()
+
+    df = df.replace(
+        [
+            np.inf,
+            -np.inf,
+        ],
+        np.nan,
+    )
+
+    df = (
+        df
+        .drop_duplicates()
+        .dropna(
+            axis=0,
+            how="any",
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    y = map_binary_labels(
+        df[label_column]
+    )
+
+    X = df.drop(
+        columns=[
+            label_column
+        ]
+    )
+
+    if len(
+        np.unique(y)
+    ) != 2:
+        raise ValueError(
+            "The paper formulation is binary benign-versus-attack; "
+            "both classes must be present."
+        )
+
+    return X, y
+
+
+class LeakageSafePreprocessor:
+    def __init__(
+        self,
+        lower_q: float,
+        upper_q: float,
+    ):
+        self.lower_q = lower_q
+        self.upper_q = upper_q
+
+        self.numeric_cols: List[
+            str
+        ] = []
+
+        self.categorical_cols: List[
+            str
+        ] = []
+
+        self.lower_: Optional[
+            pd.Series
+        ] = None
+
+        self.upper_: Optional[
+            pd.Series
+        ] = None
+
+        self.min_: Optional[
+            pd.Series
+        ] = None
+
+        self.max_: Optional[
+            pd.Series
+        ] = None
+
+        self.encoder: Optional[
+            OneHotEncoder
+        ] = None
+
+        self.feature_names_: List[
+            str
+        ] = []
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+    ):
+        self.numeric_cols = [
+            c
+            for c in X.columns
+            if pd.api.types.is_numeric_dtype(
+                X[c]
+            )
+        ]
+
+        self.categorical_cols = [
+            c
+            for c in X.columns
+            if c not in self.numeric_cols
+        ]
+
+        if self.numeric_cols:
+            num = X[
+                self.numeric_cols
+            ].apply(
+                pd.to_numeric,
+                errors="coerce",
+            )
+
+            self.lower_ = num.quantile(
+                self.lower_q
+            )
+
+            self.upper_ = num.quantile(
+                self.upper_q
+            )
+
+            clipped = num.clip(
+                self.lower_,
+                self.upper_,
+                axis=1,
+            )
+
+            self.min_ = clipped.min(
+                axis=0
+            )
+
+            self.max_ = clipped.max(
+                axis=0
+            )
+
+        if self.categorical_cols:
+            self.encoder = OneHotEncoder(
+                handle_unknown="ignore",
+                sparse_output=False,
+                dtype=np.float32,
+            )
+
+            self.encoder.fit(
+                X[
+                    self.categorical_cols
+                ].astype(str)
+            )
+
+        names = list(
+            self.numeric_cols
+        )
+
+        if self.encoder is not None:
+            names.extend(
+                self.encoder
+                .get_feature_names_out(
+                    self.categorical_cols
+                )
+                .tolist()
+            )
+
+        self.feature_names_ = names
+
+        return self
+
+    def transform(
+        self,
+        X: pd.DataFrame,
+    ) -> np.ndarray:
+        pieces = []
+
+        if self.numeric_cols:
+            num = X[
+                self.numeric_cols
+            ].apply(
+                pd.to_numeric,
+                errors="coerce",
+            )
+
+            num = num.clip(
+                self.lower_,
+                self.upper_,
+                axis=1,
+            )
+
+            denom = (
+                self.max_
+                - self.min_
+            ).replace(
+                0,
+                1.0,
+            )
+
+            num = (
+                (
+                    num
+                    - self.min_
+                )
+                / denom
+            ).clip(
+                0.0,
+                1.0,
+            )
+
+            pieces.append(
+                num.to_numpy(
+                    dtype=np.float32
+                )
+            )
+
+        if self.categorical_cols:
+            cat = self.encoder.transform(
+                X[
+                    self.categorical_cols
+                ].astype(str)
+            ).astype(
+                np.float32
+            )
+
+            pieces.append(
+                cat
+            )
+
+        if not pieces:
+            raise ValueError(
+                "No usable features remained after preprocessing."
+            )
+
+        return np.concatenate(
+            pieces,
+            axis=1,
+        ).astype(
+            np.float32,
+            copy=False,
+        )
+
+    def fit_transform(
+        self,
+        X: pd.DataFrame,
+    ) -> np.ndarray:
+        return (
+            self.fit(X)
+            .transform(X)
+        )
+
+    def get_feature_names(
+        self,
+    ) -> List[str]:
+        return list(
+            self.feature_names_
+        )
+
+
+def stratified_split_raw(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    seed: int,
+) -> Tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X,
+        y,
+        test_size=0.30,
+        random_state=seed,
+        stratify=y,
+        shuffle=True,
+    )
+
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp,
+        y_temp,
+        test_size=0.50,
+        random_state=seed,
+        stratify=y_temp,
+        shuffle=True,
+    )
+
+    return (
+        X_train,
+        X_val,
+        X_test,
+        y_train,
+        y_val,
+        y_test,
+    )
+
+
+def initial_labeled_unlabeled_indices(
+    y: np.ndarray,
+    fraction: float,
+    seed: int,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+]:
+    indices = np.arange(
+        len(y)
+    )
+
+    min_fraction = max(
+        fraction,
+        2.0 / max(
+            len(y),
+            1,
+        ),
+    )
+
+    try:
+        labeled, unlabeled = train_test_split(
+            indices,
+            train_size=min_fraction,
+            random_state=seed,
+            stratify=y,
+            shuffle=True,
+        )
+
+    except ValueError:
+        labeled, unlabeled = train_test_split(
+            indices,
+            train_size=min_fraction,
+            random_state=seed,
+            shuffle=True,
+        )
+
+    if len(
+        np.unique(
+            y[labeled]
+        )
+    ) < 2:
+        for cls in [
+            0,
+            1,
+        ]:
+            if cls not in y[labeled]:
+                candidate = np.where(
+                    y == cls
+                )[0][0]
+
+                labeled = np.unique(
+                    np.concatenate(
+                        [
+                            labeled,
+                            [candidate],
+                        ]
+                    )
+                ).astype(
+                    int
+                )
+
+                labeled_set = set(
+                    labeled.tolist()
+                )
+
+                unlabeled = np.array(
+                    [
+                        i
+                        for i in indices
+                        if i not in labeled_set
+                    ],
+                    dtype=int,
+                )
+
+    return (
+        np.asarray(
+            labeled,
+            dtype=int,
+        ),
+        np.asarray(
+            unlabeled,
+            dtype=int,
+        ),
+    )
+
+
+def make_mlp(
+    input_dim: int,
+    hidden_dim: int,
+    num_hidden_layers: int,
+    output_dim: int,
+    activation: str,
+    dropout: float,
+) -> nn.Sequential:
+    layers: List[
+        nn.Module
+    ] = []
+
+    dim = input_dim
+
+    for _ in range(
+        max(
+            1,
+            num_hidden_layers,
+        )
+    ):
+        layers.append(
+            nn.Linear(
+                dim,
+                hidden_dim,
+            )
+        )
+
+        layers.append(
+            clone_activation(
+                activation
+            )
+        )
+
+        if dropout > 0:
+            layers.append(
+                nn.Dropout(
+                    dropout
+                )
+            )
+
+        dim = hidden_dim
+
+    layers.append(
+        nn.Linear(
+            dim,
+            output_dim,
+        )
+    )
+
+    return nn.Sequential(
+        *layers
+    )
+
+
+class LSTMMLPDetector(
+    nn.Module
+):
+    def __init__(
+        self,
+        num_features: int,
+        hidden_size: int,
+        lstm_layers: int,
+        mlp_layers: int,
+        activation: str,
+        dropout: float,
+    ):
+        super().__init__()
+
+        self.num_features = (
+            num_features
+        )
+
+        self.hidden_size = (
+            hidden_size
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=hidden_size,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=(
+                dropout
+                if lstm_layers > 1
+                else 0.0
+            ),
+        )
+
+
+        self.score_net = make_mlp(
+            input_dim=hidden_size,
+            hidden_dim=hidden_size,
+            num_hidden_layers=mlp_layers,
+            output_dim=1,
+            activation=activation,
+            dropout=dropout,
+        )
+
+        self.classifier = make_mlp(
+            input_dim=hidden_size,
+            hidden_dim=hidden_size,
+            num_hidden_layers=mlp_layers,
+            output_dim=1,
+            activation=activation,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        feature_mask: Optional[
+            torch.Tensor
+        ] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+    
+        if x.dim() == 2:
+            x = x.unsqueeze(
+                -1
+            )
+
+        if feature_mask is not None:
+            if feature_mask.dim() == 1:
+                feature_mask = (
+                    feature_mask
+                    .unsqueeze(0)
+                )
+
+            x = (
+                x
+                * feature_mask
+                .unsqueeze(-1)
+                .to(x.dtype)
+            )
+
+        seq_out, _ = self.lstm(
+            x
+        )
+
+        raw_scores = (
+            self.score_net(
+                seq_out
+            )
+            .squeeze(-1)
+        )
+
+        attention = torch.softmax(
+            raw_scores,
+            dim=1,
+        )
+
+        context = torch.sum(
+            seq_out
+            * attention.unsqueeze(
+                -1
+            ),
+            dim=1,
+        )
+
+        logit = (
+            self.classifier(
+                context
+            )
+            .squeeze(-1)
+        )
+
+        return (
+            context,
+            raw_scores,
+            logit,
+        )
+
+
+class CategoricalPolicy(
+    nn.Module
+):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        activation: str,
+        dropout: float,
+    ):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(
+                state_dim,
+                hidden_dim,
+            ),
+            clone_activation(
+                activation
+            ),
+            (
+                nn.Dropout(
+                    dropout
+                )
+                if dropout > 0
+                else nn.Identity()
+            ),
+            nn.Linear(
+                hidden_dim,
+                action_dim,
+            ),
+        )
+
+    def logits(
+        self,
+        states: torch.Tensor,
+        action_masks: Optional[
+            torch.Tensor
+        ] = None,
+    ) -> torch.Tensor:
+        logits = self.net(
+            states
+        )
+
+        if action_masks is not None:
+            logits = logits.masked_fill(
+                ~action_masks.bool(),
+                -1e9,
+            )
+
+        return logits
+
+    def distribution(
+        self,
+        states: torch.Tensor,
+        action_masks: Optional[
+            torch.Tensor
+        ] = None,
+    ) -> Categorical:
+        return Categorical(
+            logits=self.logits(
+                states,
+                action_masks,
+            )
+        )
+
+
+class ValueNetwork(
+    nn.Module
+):
+    def __init__(
+        self,
+        state_dim: int,
+        hidden_dim: int,
+        activation: str,
+    ):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(
+                state_dim,
+                hidden_dim,
+            ),
+            clone_activation(
+                activation
+            ),
+            nn.Linear(
+                hidden_dim,
+                hidden_dim,
+            ),
+            clone_activation(
+                activation
+            ),
+            nn.Linear(
+                hidden_dim,
+                1,
+            ),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.net(
+            x
+        ).squeeze(
+            -1
+        )
+
+
+class TrajectoryBuffer:
+    def __init__(
+        self,
+    ):
+        self.states: List[
+            np.ndarray
+        ] = []
+
+        self.actions: List[
+            int
+        ] = []
+
+        self.rewards: List[
+            float
+        ] = []
+
+        self.next_states: List[
+            np.ndarray
+        ] = []
+
+        self.dones: List[
+            bool
+        ] = []
+
+        self.action_masks: List[
+            np.ndarray
+        ] = []
+
+    def add(
+        self,
+        state,
+        action,
+        reward,
+        next_state,
+        done,
+        action_mask,
+    ):
+        self.states.append(
+            np.asarray(
+                state,
+                dtype=np.float32,
+            )
+        )
+
+        self.actions.append(
+            int(
+                action
+            )
+        )
+
+        self.rewards.append(
+            float(
+                reward
+            )
+        )
+
+        self.next_states.append(
+            np.asarray(
+                next_state,
+                dtype=np.float32,
+            )
+        )
+
+        self.dones.append(
+            bool(
+                done
+            )
+        )
+
+        self.action_masks.append(
+            np.asarray(
+                action_mask,
+                dtype=bool,
+            )
+        )
+
+    def __len__(
+        self,
+    ):
+        return len(
+            self.actions
+        )
+
+    def clear(
+        self,
+    ):
+        self.__init__()
+
+
+class ERTRPO:
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        activation: str,
+        dropout: float,
+        entropy_coef: float,
+        value_learning_rate: float,
+        settings: FixedSettings,
+        device: torch.device,
+    ):
+        self.device = (
+            device
+        )
+
+        self.policy = CategoricalPolicy(
+            state_dim,
+            action_dim,
+            hidden_dim,
+            activation,
+            dropout,
+        ).to(
+            device
+        )
+
+        self.value = ValueNetwork(
+            state_dim,
+            settings.value_hidden_size,
+            activation,
+        ).to(
+            device
+        )
+
+        self.value_optimizer = torch.optim.Adam(
+            self.value.parameters(),
+            lr=float(
+                value_learning_rate
+            ),
+        )
+
+        self.entropy_coef = float(
+            entropy_coef
+        )
+
+        self.settings = (
+            settings
+        )
+
+    def act(
+        self,
+        state: np.ndarray,
+        action_mask: np.ndarray,
+        deterministic: bool = False,
+    ) -> int:
+        state_tensor = torch.as_tensor(
+            state,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(
+            0
+        )
+
+        mask_tensor = torch.as_tensor(
+            action_mask,
+            dtype=torch.bool,
+            device=self.device,
+        ).unsqueeze(
+            0
+        )
+
+        with torch.no_grad():
+            dist = self.policy.distribution(
+                state_tensor,
+                mask_tensor,
+            )
+
+            if deterministic:
+                return int(
+                    torch.argmax(
+                        dist.probs,
+                        dim=-1,
+                    ).item()
+                )
+
+            return int(
+                dist.sample().item()
+            )
+
+    @staticmethod
+    def _flat_params(
+        module: nn.Module,
+    ) -> torch.Tensor:
+        return torch.cat(
+            [
+                p.data.view(-1)
+                for p in module.parameters()
+            ]
+        )
+
+    @staticmethod
+    def _set_flat_params(
+        module: nn.Module,
+        flat: torch.Tensor,
+    ) -> None:
+        offset = 0
+
+        for parameter in module.parameters():
+            n_values = (
+                parameter.numel()
+            )
+
+            parameter.data.copy_(
+                flat[
+                    offset:
+                    offset + n_values
+                ].view_as(
+                    parameter
+                )
+            )
+
+            offset += n_values
+
+    @staticmethod
+    def _flat_grad(
+        grads: Sequence[
+            Optional[
+                torch.Tensor
+            ]
+        ],
+        params: Sequence[
+            torch.Tensor
+        ],
+    ) -> torch.Tensor:
+        pieces = []
+
+        for grad, parameter in zip(
+            grads,
+            params,
+        ):
+            if grad is None:
+                pieces.append(
+                    torch.zeros_like(
+                        parameter
+                    ).view(-1)
+                )
+
+            else:
+                pieces.append(
+                    grad
+                    .contiguous()
+                    .view(-1)
+                )
+
+        return torch.cat(
+            pieces
+        )
+
+    def _conjugate_gradient(
+        self,
+        Avp,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.zeros_like(
+            b
+        )
+
+        residual = b.clone()
+        direction = b.clone()
+
+        residual_dot = torch.dot(
+            residual,
+            residual,
+        )
+
+        for _ in range(
+            self.settings.cg_iterations
+        ):
+            Avp_direction = Avp(
+                direction
+            )
+
+            denominator = (
+                torch.dot(
+                    direction,
+                    Avp_direction,
+                )
+                + self.settings.epsilon
+            )
+
+            alpha = (
+                residual_dot
+                / denominator
+            )
+
+            x = (
+                x
+                + alpha
+                * direction
+            )
+
+            residual = (
+                residual
+                - alpha
+                * Avp_direction
+            )
+
+            new_residual_dot = torch.dot(
+                residual,
+                residual,
+            )
+
+            if (
+                new_residual_dot
+                < 1e-12
+            ):
+                break
+
+            beta = (
+                new_residual_dot
+                / (
+                    residual_dot
+                    + self.settings.epsilon
+                )
+            )
+
+            direction = (
+                residual
+                + beta
+                * direction
+            )
+
+            residual_dot = (
+                new_residual_dot
+            )
+
+        return x
+
+    def _n_step_targets(
+        self,
+        states: torch.Tensor,
+        rewards: np.ndarray,
+        next_states: torch.Tensor,
+        dones: np.ndarray,
+    ) -> torch.Tensor:
+        del states
+
+        with torch.no_grad():
+            next_values = (
+                self.value(
+                    next_states
+                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+        targets = np.zeros(
+            len(rewards),
+            dtype=np.float32,
+        )
+
+        n_step = (
+            self.settings.n_step
+        )
+
+        gamma = (
+            self.settings.gamma
+        )
+
+        for t in range(
+            len(rewards)
+        ):
+            return_value = 0.0
+            discount = 1.0
+            terminal = False
+            last_index = t
+
+            for step in range(
+                n_step
+            ):
+                idx = (
+                    t
+                    + step
+                )
+
+                if idx >= len(
+                    rewards
+                ):
+                    break
+
+                return_value += (
+                    discount
+                    * rewards[idx]
+                )
+
+                last_index = (
+                    idx
+                )
+
+                if dones[idx]:
+                    terminal = True
+                    break
+
+                discount *= (
+                    gamma
+                )
+
+            if not terminal:
+                return_value += (
+                    discount
+                    * next_values[
+                        last_index
+                    ]
+                )
+
+            targets[t] = (
+                return_value
+            )
+
+        return torch.as_tensor(
+            targets,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    def update(
+        self,
+        buffer: TrajectoryBuffer,
+        homotopy_rho: float = 1.0,
+    ) -> Dict[
+        str,
+        float,
+    ]:
+        if len(buffer) < 2:
+            return {
+                "policy_objective": 0.0,
+                "max_kl": 0.0,
+                "value_loss": 0.0,
+            }
+
+        states = torch.as_tensor(
+            np.stack(
+                buffer.states
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        actions = torch.as_tensor(
+            buffer.actions,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        rewards = np.asarray(
+            buffer.rewards,
+            dtype=np.float32,
+        )
+
+        next_states = torch.as_tensor(
+            np.stack(
+                buffer.next_states
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        dones = np.asarray(
+            buffer.dones,
+            dtype=bool,
+        )
+
+        masks = torch.as_tensor(
+            np.stack(
+                buffer.action_masks
+            ),
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        targets = self._n_step_targets(
+            states,
+            rewards,
+            next_states,
+            dones,
+        )
+
+        with torch.no_grad():
+            values = self.value(
+                states
+            )
+
+        advantages = (
+            targets
+            - values
+        )
+
+        
+        advantages = (
+            advantages
+            - advantages.mean()
+        ) / (
+            advantages.std(
+                unbiased=False
+            )
+            + 1e-8
+        )
+
+        with torch.no_grad():
+            old_logits = self.policy.logits(
+                states,
+                masks,
+            )
+
+            old_dist = Categorical(
+                logits=old_logits
+            )
+
+            old_logp = old_dist.log_prob(
+                actions
+            )
+
+            old_probs = (
+                old_dist.probs
+            )
+
+            old_log_probs_all = (
+                torch.log_softmax(
+                    old_logits,
+                    dim=-1,
+                )
+            )
+
+        params = [
+            p
+            for p in self.policy.parameters()
+            if p.requires_grad
+        ]
+
+        def surrogate_and_kl():
+            logits = self.policy.logits(
+                states,
+                masks,
+            )
+
+            dist = Categorical(
+                logits=logits
+            )
+
+            logp = dist.log_prob(
+                actions
+            )
+
+            ratio = torch.exp(
+                logp
+                - old_logp
+            )
+
+            entropy = (
+                dist.entropy()
+            )
+
+            objective = torch.mean(
+                ratio
+                * advantages
+                + (
+                    homotopy_rho
+                    * self.entropy_coef
+                )
+                * entropy
+            )
+
+            new_log_probs_all = torch.log_softmax(
+                logits,
+                dim=-1,
+            )
+
+            kl_per_state = torch.sum(
+                old_probs
+                * (
+                    old_log_probs_all
+                    - new_log_probs_all
+                ),
+                dim=-1,
+            )
+
+            return (
+                objective,
+                kl_per_state,
+            )
+
+        objective, _ = (
+            surrogate_and_kl()
+        )
+
+        grads = torch.autograd.grad(
+            objective,
+            params,
+            create_graph=False,
+            allow_unused=True,
+        )
+
+        gradient = self._flat_grad(
+            grads,
+            params,
+        ).detach()
+
+        if (
+            torch.linalg.vector_norm(
+                gradient
+            )
+            < 1e-10
+        ):
+            return {
+                "policy_objective": float(
+                    objective.item()
+                ),
+                "max_kl": 0.0,
+                "value_loss": 0.0,
+            }
+
+        def hessian_vector_product(
+            vector: torch.Tensor,
+        ) -> torch.Tensor:
+            logits = self.policy.logits(
+                states,
+                masks,
+            )
+
+            new_log_probs_all = (
+                torch.log_softmax(
+                    logits,
+                    dim=-1,
+                )
+            )
+
+            kl_mean = torch.mean(
+                torch.sum(
+                    old_probs
+                    * (
+                        old_log_probs_all
+                        - new_log_probs_all
+                    ),
+                    dim=-1,
+                )
+            )
+
+            grad_kl = torch.autograd.grad(
+                kl_mean,
+                params,
+                create_graph=True,
+                allow_unused=True,
+            )
+
+            flat_grad_kl = self._flat_grad(
+                grad_kl,
+                params,
+            )
+
+            directional_derivative = torch.dot(
+                flat_grad_kl,
+                vector,
+            )
+
+            hvp = torch.autograd.grad(
+                directional_derivative,
+                params,
+                retain_graph=False,
+                allow_unused=True,
+            )
+
+            flat_hvp = self._flat_grad(
+                hvp,
+                params,
+            ).detach()
+
+            return (
+                flat_hvp
+                + self.settings.cg_damping
+                * vector
+            )
+
+        step_direction = self._conjugate_gradient(
+            hessian_vector_product,
+            gradient,
+        )
+
+        hessian_step = hessian_vector_product(
+            step_direction
+        )
+
+        shs = 0.5 * torch.dot(
+            step_direction,
+            hessian_step,
+        )
+
+        if (
+            not torch.isfinite(
+                shs
+            )
+            or shs <= 0
+        ):
+            return {
+                "policy_objective": float(
+                    objective.item()
+                ),
+                "max_kl": 0.0,
+                "value_loss": 0.0,
+            }
+
+        scale = torch.sqrt(
+            self.settings.kl_delta
+            / (
+                shs
+                + self.settings.epsilon
+            )
+        )
+
+        full_step = (
+            step_direction
+            * scale
+        )
+
+        old_params = self._flat_params(
+            self.policy
+        ).clone()
+
+        old_objective = (
+            objective.detach()
+        )
+
+        accepted = False
+        final_max_kl = 0.0
+        final_objective = float(
+            old_objective.item()
+        )
+
+        for line_step in range(
+            self.settings.line_search_steps
+        ):
+            fraction = (
+                self.settings.line_search_backtrack
+                ** line_step
+            )
+
+            candidate = (
+                old_params
+                + fraction
+                * full_step
+            )
+
+            self._set_flat_params(
+                self.policy,
+                candidate,
+            )
+
+            with torch.no_grad():
+                new_objective, kl_per_state = (
+                    surrogate_and_kl()
+                )
+
+                max_kl = float(
+                    torch.max(
+                        kl_per_state
+                    ).item()
+                )
+
+                improves = (
+                    float(
+                        new_objective.item()
+                    )
+                    > float(
+                        old_objective.item()
+                    )
+                )
+
+         
+            if (
+                improves
+                and max_kl
+                <= self.settings.kl_delta
+            ):
+                accepted = True
+                final_max_kl = (
+                    max_kl
+                )
+
+                final_objective = float(
+                    new_objective.item()
+                )
+
+                break
+
+        if not accepted:
+            self._set_flat_params(
+                self.policy,
+                old_params,
+            )
+
+        value_loss_value = 0.0
+
+        for _ in range(
+            self.settings.value_iterations
+        ):
+            predicted_value = self.value(
+                states
+            )
+
+            value_loss = F.mse_loss(
+                predicted_value,
+                targets,
+            )
+
+            self.value_optimizer.zero_grad()
+
+            value_loss.backward()
+
+            self.value_optimizer.step()
+
+            value_loss_value = float(
+                value_loss.item()
+            )
+
+        return {
+            "policy_objective": final_objective,
+            "max_kl": final_max_kl,
+            "value_loss": value_loss_value,
+        }
+
+
+def evaluate_binary(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    threshold: float = 0.5,
+) -> Dict[
+    str,
+    float,
+]:
+    y_true = np.asarray(
+        y_true
+    ).astype(
+        int
+    )
+
+    probabilities = np.asarray(
+        probabilities,
+        dtype=float,
+    )
+
+    y_pred = (
+        probabilities
+        >= threshold
+    ).astype(
+        int
+    )
+
+    tn, fp, fn, tp = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=[
+            0,
+            1,
+        ],
+    ).ravel()
+
+    sensitivity = recall_score(
+        y_true,
+        y_pred,
+        zero_division=0,
+    )
+
+    specificity = (
+        tn
+        / max(
+            tn + fp,
+            1,
+        )
+    )
+
+    precision = precision_score(
+        y_true,
+        y_pred,
+        zero_division=0,
+    )
+
+    result = {
+        "accuracy": accuracy_score(
+            y_true,
+            y_pred,
+        ),
+        "sensitivity": sensitivity,
+        "f_measure": f1_score(
+            y_true,
+            y_pred,
+            zero_division=0,
+        ),
+        "balanced_accuracy": balanced_accuracy_score(
+            y_true,
+            y_pred,
+        ),
+        "mcc": matthews_corrcoef(
+            y_true,
+            y_pred,
+        ),
+        "precision": precision,
+        "specificity": specificity,
+        "fpr": (
+            fp
+            / max(
+                fp + tn,
+                1,
+            )
+        ),
+        "fnr": (
+            fn
+            / max(
+                fn + tp,
+                1,
+            )
+        ),
+        "tp": int(tp),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+    }
+
+    try:
+        result["roc_auc"] = roc_auc_score(
+            y_true,
+            probabilities,
+        )
+
+    except ValueError:
+        result["roc_auc"] = (
+            float("nan")
+        )
+
+    try:
+        result["pr_auc"] = average_precision_score(
+            y_true,
+            probabilities,
+        )
+
+    except ValueError:
+        result["pr_auc"] = (
+            float("nan")
+        )
+
+    return result
+
+
+class LimeAttributor:
+    def __init__(
+        self,
+        training_data: np.ndarray,
+        feature_names: Sequence[str],
+        predict_proba_fn,
+        seed: int,
+        num_samples: int,
+        kernel_width: Optional[
+            float
+        ],
+    ):
+        try:
+            from lime.lime_tabular import (
+                LimeTabularExplainer,
+            )
+
+        except ImportError as exc:
+            raise ImportError(
+                "LIME is required. Install the paper dependency, "
+                "for example lime==0.2.0.1."
+            ) from exc
+
+        kwargs = {
+            "training_data": training_data,
+            "feature_names": list(
+                feature_names
+            ),
+            "class_names": [
+                "benign",
+                "attack",
+            ],
+            "mode": "classification",
+            "discretize_continuous": False,
+            "random_state": seed,
+        }
+
+        if kernel_width is not None:
+            kwargs[
+                "kernel_width"
+            ] = kernel_width
+
+        self.explainer = LimeTabularExplainer(
+            **kwargs
+        )
+
+        self.predict_proba_fn = (
+            predict_proba_fn
+        )
+
+        self.num_features = (
+            training_data.shape[1]
+        )
+
+        self.num_samples = (
+            num_samples
+        )
+
+    def normalized_abs_attributions(
+        self,
+        x: np.ndarray,
+    ) -> np.ndarray:
+        explanation = self.explainer.explain_instance(
+            x,
+            self.predict_proba_fn,
+            num_features=self.num_features,
+            num_samples=self.num_samples,
+            top_labels=2,
+        )
+
+        class_key = (
+            1
+            if 1 in explanation.local_exp
+            else next(
+                iter(
+                    explanation.local_exp
+                )
+            )
+        )
+
+        values = np.zeros(
+            self.num_features,
+            dtype=np.float32,
+        )
+
+        for feature_index, weight in explanation.local_exp[
+            class_key
+        ]:
+            if (
+                0
+                <= feature_index
+                < self.num_features
+            ):
+                values[
+                    feature_index
+                ] = abs(
+                    float(weight)
+                )
+
+        total = float(
+            values.sum()
+        )
+
+        return (
+            values
+            / (
+                total
+                + 1e-8
+            )
+        )
+
+
+class DualAgentFramework:
+    def __init__(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        feature_names: Sequence[str],
+        config: Dict,
+        settings: FixedSettings,
+        seed: int,
+        use_lime: bool = True,
+        use_active_learning: bool = True,
+        use_feature_selection: bool = True,
+        use_imbalance_reward: bool = True,
+        use_entropy: bool = True,
+    ):
+        set_seed(
+            seed
+        )
+
+        self.rng = np.random.default_rng(
+            seed
+        )
+
+        self.seed = (
+            seed
+        )
+
+        self.device = torch.device(
+            settings.device
+        )
+
+        self.settings = (
+            settings
+        )
+
+        self.config = dict(
+            config
+        )
+
+        self.X_train = np.asarray(
+            X_train,
+            dtype=np.float32,
+        )
+
+        self.y_train = np.asarray(
+            y_train,
+            dtype=np.int64,
+        )
+
+        self.X_val = np.asarray(
+            X_val,
+            dtype=np.float32,
+        )
+
+        self.y_val = np.asarray(
+            y_val,
+            dtype=np.int64,
+        )
+
+        self.feature_names = list(
+            feature_names
+        )
+
+        self.num_features = (
+            self.X_train.shape[1]
+        )
+
+        self.use_lime = (
+            use_lime
+        )
+
+        self.use_active_learning = (
+            use_active_learning
+        )
+
+        self.use_feature_selection = (
+            use_feature_selection
+        )
+
+        self.use_imbalance_reward = (
+            use_imbalance_reward
+        )
+
+        self.use_entropy = (
+            use_entropy
+        )
+
+        (
+            self.labeled_idx,
+            self.unlabeled_idx,
+        ) = initial_labeled_unlabeled_indices(
+            self.y_train,
+            settings.initial_labeled_fraction,
+            seed,
+        )
+
+        self.annotation_count = 0
+        self.al_global_step = 0
+
+        self.detector = LSTMMLPDetector(
+            num_features=self.num_features,
+            hidden_size=settings.lstm_hidden_size,
+            lstm_layers=int(
+                config[
+                    "lstm_layers"
+                ]
+            ),
+            mlp_layers=int(
+                config[
+                    "mlp_layers"
+                ]
+            ),
+            activation=config[
+                "agent2_activation"
+            ],
+            dropout=float(
+                config[
+                    "agent2_dropout"
+                ]
+            ),
+        ).to(
+            self.device
+        )
+
+        self.detector_optimizer = torch.optim.Adam(
+            self.detector.parameters(),
+            lr=float(
+                config[
+                    "agent2_learning_rate"
+                ]
+            ),
+        )
+
+        agent1_state_dim = (
+            settings.lstm_hidden_size
+            + 1
+        )
+
+        agent2_state_dim = (
+            settings.lstm_hidden_size
+            + self.num_features
+            + self.num_features
+        )
+
+        entropy_agent1 = (
+            float(
+                config[
+                    "agent1_entropy_coefficient"
+                ]
+            )
+            if use_entropy
+            else 0.0
+        )
+
+        entropy_agent2 = (
+            float(
+                config[
+                    "agent2_entropy_coefficient"
+                ]
+            )
+            if use_entropy
+            else 0.0
+        )
+
+        self.agent1 = ERTRPO(
+            state_dim=agent1_state_dim,
+            action_dim=2,
+            hidden_dim=settings.policy_hidden_size,
+            activation=config[
+                "agent1_activation"
+            ],
+            dropout=float(
+                config[
+                    "agent1_dropout"
+                ]
+            ),
+            entropy_coef=entropy_agent1,
+            value_learning_rate=float(
+                config[
+                    "agent1_learning_rate"
+                ]
+            ),
+            settings=settings,
+            device=self.device,
+        )
+
+        self.agent2 = ERTRPO(
+            state_dim=agent2_state_dim,
+            action_dim=2,
+            hidden_dim=settings.policy_hidden_size,
+            activation=config[
+                "agent2_activation"
+            ],
+            dropout=float(
+                config[
+                    "agent2_dropout"
+                ]
+            ),
+            entropy_coef=entropy_agent2,
+            value_learning_rate=float(
+                config[
+                    "agent2_learning_rate"
+                ]
+            ),
+            settings=settings,
+            device=self.device,
+        )
+
+        self.history: List[
+            Dict[
+                str,
+                float,
+            ]
+        ] = []
+
+    def _tensor(
+        self,
+        x: np.ndarray,
+    ) -> torch.Tensor:
+        return torch.as_tensor(
+            x,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    def train_detector(
+        self,
+        epochs: int = 1,
+    ) -> float:
+        if len(
+            self.labeled_idx
+        ) == 0:
+            raise RuntimeError(
+                "No labeled samples are available for detector training."
+            )
+
+        dataset = TensorDataset(
+            torch.as_tensor(
+                self.X_train[
+                    self.labeled_idx
+                ],
+                dtype=torch.float32,
+            ),
+            torch.as_tensor(
+                self.y_train[
+                    self.labeled_idx
+                ],
+                dtype=torch.float32,
+            ),
+        )
+
+        generator = torch.Generator()
+
+        generator.manual_seed(
+            self.seed
+            + len(
+                self.history
+            )
+            + self.annotation_count
+        )
+
+        loader = DataLoader(
+            dataset,
+            batch_size=int(
+                self.config[
+                    "agent2_batch_size"
+                ]
+            ),
+            shuffle=True,
+            generator=generator,
+            drop_last=False,
+        )
+
+        self.detector.train()
+
+        last_loss = 0.0
+
+        for _ in range(
+            max(
+                1,
+                int(epochs),
+            )
+        ):
+            for xb, yb in loader:
+                xb = xb.to(
+                    self.device
+                )
+
+                yb = yb.to(
+                    self.device
+                )
+
+                _, _, logits = self.detector(
+                    xb
+                )
+
+          
+                loss = F.binary_cross_entropy_with_logits(
+                    logits,
+                    yb,
+                )
+
+                self.detector_optimizer.zero_grad()
+
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(
+                    self.detector.parameters(),
+                    max_norm=5.0,
+                )
+
+                self.detector_optimizer.step()
+
+                last_loss = float(
+                    loss.item()
+                )
+
+        return last_loss
+
+    @torch.no_grad()
+    def detector_components(
+        self,
+        X: np.ndarray,
+        batch_size: int = 2048,
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
+        self.detector.eval()
+
+        representations = []
+        scores = []
+        probabilities = []
+
+        for start in range(
+            0,
+            len(X),
+            batch_size,
+        ):
+            xb = self._tensor(
+                X[
+                    start:
+                    start + batch_size
+                ]
+            )
+
+            representation, feature_scores, logit = self.detector(
+                xb
+            )
+
+            representations.append(
+                representation
+                .cpu()
+                .numpy()
+            )
+
+            scores.append(
+                feature_scores
+                .cpu()
+                .numpy()
+            )
+
+            probabilities.append(
+                torch.sigmoid(
+                    logit
+                )
+                .cpu()
+                .numpy()
+            )
+
+        return (
+            np.concatenate(
+                representations
+            ),
+            np.concatenate(
+                scores
+            ),
+            np.concatenate(
+                probabilities
+            ),
+        )
+
+    @torch.no_grad()
+    def detector_probabilities(
+        self,
+        X: np.ndarray,
+        feature_mask: Optional[
+            np.ndarray
+        ] = None,
+        batch_size: int = 2048,
+    ) -> np.ndarray:
+        self.detector.eval()
+
+        result = []
+
+        for start in range(
+            0,
+            len(X),
+            batch_size,
+        ):
+            xb = self._tensor(
+                X[
+                    start:
+                    start + batch_size
+                ]
+            )
+
+            mask_tensor = None
+
+            if feature_mask is not None:
+                mask = np.asarray(
+                    feature_mask,
+                    dtype=np.float32,
+                )
+
+                mask_tensor = self._tensor(
+                    np.repeat(
+                        mask[
+                            None,
+                            :
+                        ],
+                        len(xb),
+                        axis=0,
+                    )
+                )
+
+            _, _, logit = self.detector(
+                xb,
+                mask_tensor,
+            )
+
+            result.append(
+                torch.sigmoid(
+                    logit
+                )
+                .cpu()
+                .numpy()
+            )
+
+        return np.concatenate(
+            result
+        )
+
+    def lime_predict_proba(
+        self,
+        X: np.ndarray,
+    ) -> np.ndarray:
+        probability = self.detector_probabilities(
+            np.asarray(
+                X,
+                dtype=np.float32,
+            )
+        )
+
+        return np.column_stack(
+            [
+                1.0
+                - probability,
+                probability,
+            ]
+        )
+
+    def validation_ba(
+        self,
+        feature_mask: Optional[
+            np.ndarray
+        ] = None,
+    ) -> float:
+        X_val = self.X_val
+        y_val = self.y_val
+
+        if (
+            self.settings.validation_reward_max_samples
+            is not None
+            and len(X_val)
+            > self.settings.validation_reward_max_samples
+        ):
+            
+            indices = self.rng.choice(
+                len(X_val),
+                self.settings.validation_reward_max_samples,
+                replace=False,
+            )
+
+            X_val = X_val[
+                indices
+            ]
+
+            y_val = y_val[
+                indices
+            ]
+
+        probability = self.detector_probabilities(
+            X_val,
+            feature_mask=feature_mask,
+        )
+
+        prediction = (
+            probability
+            >= 0.5
+        ).astype(
+            int
+        )
+
+        return float(
+            balanced_accuracy_score(
+                y_val,
+                prediction,
+            )
+        )
+
+    def _class_weights(
+        self,
+    ) -> Dict[
+        int,
+        float,
+    ]:
+        labels = self.y_train[
+            self.labeled_idx
+        ]
+
+        n_total = len(
+            labels
+        )
+
+        result = {}
+
+        for class_id in [
+            0,
+            1,
+        ]:
+            n_class = int(
+                np.sum(
+                    labels
+                    == class_id
+                )
+            )
+
+            result[
+                class_id
+            ] = (
+                n_total
+                / (
+                    2.0
+                    * max(
+                        n_class,
+                        1,
+                    )
+                )
+            )
+
+        return result
+
+    def _agent2_state(
+        self,
+        representation: np.ndarray,
+        feature_scores: np.ndarray,
+        active_mask: np.ndarray,
+    ) -> np.ndarray:
+        return np.concatenate(
+            [
+                representation.astype(
+                    np.float32
+                ),
+                feature_scores.astype(
+                    np.float32
+                ),
+                active_mask.astype(
+                    np.float32
+                ),
+            ]
+        )
+
+    def _lime_attributor(
+        self,
+    ) -> Optional[
+        LimeAttributor
+    ]:
+        if not self.use_lime:
+            return None
+
+        return LimeAttributor(
+            training_data=self.X_train[
+                self.labeled_idx
+            ],
+            feature_names=self.feature_names,
+            predict_proba_fn=self.lime_predict_proba,
+            seed=(
+                self.seed
+                + len(
+                    self.history
+                )
+            ),
+            num_samples=self.settings.lime_num_samples,
+            kernel_width=self.settings.lime_kernel_width,
+        )
+
+    def train_agent2_epoch(
+        self,
+        homotopy_rho: float,
+    ) -> Dict[
+        str,
+        float,
+    ]:
+        detector_loss = self.train_detector(
+            epochs=1
+        )
+
+        class_weights = self._class_weights()
+
+        indices = self.labeled_idx.copy()
+
+        self.rng.shuffle(
+            indices
+        )
+
+        attributor = (
+            self._lime_attributor()
+        )
+
+        lime_cache: Dict[
+            int,
+            np.ndarray,
+        ] = {}
+
+        validation_cache: Dict[
+            Tuple[
+                int,
+                ...
+            ],
+            float,
+        ] = {}
+
+        policy_stats = []
+
+        batch_size = int(
+            self.config[
+                "agent2_batch_size"
+            ]
+        )
+
+        for batch_start in range(
+            0,
+            len(indices),
+            batch_size,
+        ):
+            batch_indices = indices[
+                batch_start:
+                batch_start
+                + batch_size
+            ]
+
+            trajectory = TrajectoryBuffer()
+
+            for sample_index in batch_indices:
+                x = self.X_train[
+                    sample_index
+                ]
+
+                y = int(
+                    self.y_train[
+                        sample_index
+                    ]
+                )
+
+                (
+                    representation,
+                    scores,
+                    _,
+                ) = self.detector_components(
+                    x[
+                        None,
+                        :
+                    ],
+                    batch_size=1,
+                )
+
+                representation = (
+                    representation[0]
+                )
+
+                scores = (
+                    scores[0]
+                )
+
+                active = np.zeros(
+                    self.num_features,
+                    dtype=bool,
+                )
+
+                episode_done = False
+
+                max_steps = (
+                    self.num_features
+                    + 1
+                )
+
+                for _ in range(
+                    max_steps
+                ):
+                    state = self._agent2_state(
+                        representation,
+                        scores,
+                        active,
+                    )
+
+                    can_select = (
+                        self.use_feature_selection
+                        and np.any(
+                            ~active
+                        )
+                    )
+
+                    action_mask = np.array(
+                        [
+                            can_select,
+                            True,
+                        ],
+                        dtype=bool,
+                    )
+
+                    action = self.agent2.act(
+                        state,
+                        action_mask,
+                        deterministic=False,
+                    )
+
+                    if (
+                        action == 0
+                        and can_select
+                    ):
+                        before_key = tuple(
+                            np.flatnonzero(
+                                active
+                            ).tolist()
+                        )
+
+                        if (
+                            before_key
+                            not in validation_cache
+                        ):
+                            validation_cache[
+                                before_key
+                            ] = self.validation_ba(
+                                active.astype(
+                                    np.float32
+                                )
+                            )
+
+                        before_ba = validation_cache[
+                            before_key
+                        ]
+
+                        unselected = np.flatnonzero(
+                            ~active
+                        )
+
+                        best_feature = int(
+                            unselected[
+                                np.argmax(
+                                    scores[
+                                        unselected
+                                    ]
+                                )
+                            ]
+                        )
+
+                        active[
+                            best_feature
+                        ] = True
+
+                        after_key = tuple(
+                            np.flatnonzero(
+                                active
+                            ).tolist()
+                        )
+
+                        if (
+                            after_key
+                            not in validation_cache
+                        ):
+                            validation_cache[
+                                after_key
+                            ] = self.validation_ba(
+                                active.astype(
+                                    np.float32
+                                )
+                            )
+
+                        delta_ba = (
+                            validation_cache[
+                                after_key
+                            ]
+                            - before_ba
+                        )
+
+                        if self.use_lime:
+                            if (
+                                sample_index
+                                not in lime_cache
+                            ):
+                                lime_cache[
+                                    sample_index
+                                ] = attributor.normalized_abs_attributions(
+                                    x
+                                )
+
+                            relevance = float(
+                                lime_cache[
+                                    sample_index
+                                ][
+                                    best_feature
+                                ]
+                            )
+
+                        else:
+                            relevance = 0.0
+
+                        reward = (
+                            float(
+                                self.config[
+                                    "feature_relevance_weight"
+                                ]
+                            )
+                            * relevance
+                            - float(
+                                self.config[
+                                    "subset_complexity_weight"
+                                ]
+                            )
+                            * float(
+                                active.sum()
+                            )
+                            + float(
+                                self.config[
+                                    "validation_improvement_weight"
+                                ]
+                            )
+                            * delta_ba
+                        )
+
+                        next_state = self._agent2_state(
+                            representation,
+                            scores,
+                            active,
+                        )
+
+                        done = False
+
+                    else:
+                        probability = float(
+                            self.detector_probabilities(
+                                x[
+                                    None,
+                                    :
+                                ],
+                                active.astype(
+                                    np.float32
+                                ),
+                            )[0]
+                        )
+
+                        prediction = int(
+                            probability
+                            >= 0.5
+                        )
+
+                        weight = (
+                            class_weights[
+                                y
+                            ]
+                            if self.use_imbalance_reward
+                            else 1.0
+                        )
+
+                        reward = (
+                            weight
+                            if prediction == y
+                            else -weight
+                        )
+
+                        next_state = np.zeros_like(
+                            state,
+                            dtype=np.float32,
+                        )
+
+                        done = True
+                        episode_done = True
+
+                    trajectory.add(
+                        state,
+                        action,
+                        reward,
+                        next_state,
+                        done,
+                        action_mask,
+                    )
+
+                    if episode_done:
+                        break
+
+                if not episode_done:
+                    state = self._agent2_state(
+                        representation,
+                        scores,
+                        active,
+                    )
+
+                    probability = float(
+                        self.detector_probabilities(
+                            x[
+                                None,
+                                :
+                            ],
+                            active.astype(
+                                np.float32
+                            ),
+                        )[0]
+                    )
+
+                    prediction = int(
+                        probability
+                        >= 0.5
+                    )
+
+                    weight = (
+                        class_weights[
+                            y
+                        ]
+                        if self.use_imbalance_reward
+                        else 1.0
+                    )
+
+                    reward = (
+                        weight
+                        if prediction == y
+                        else -weight
+                    )
+
+                    trajectory.add(
+                        state,
+                        1,
+                        reward,
+                        np.zeros_like(
+                            state
+                        ),
+                        True,
+                        np.array(
+                            [
+                                False,
+                                True,
+                            ]
+                        ),
+                    )
+
+            if len(
+                trajectory
+            ) >= 2:
+                
+                policy_stats.append(
+                    self.agent2.update(
+                        trajectory,
+                        homotopy_rho=homotopy_rho,
+                    )
+                )
+
+        if policy_stats:
+            average_kl = float(
+                np.mean(
+                    [
+                        stat[
+                            "max_kl"
+                        ]
+                        for stat in policy_stats
+                    ]
+                )
+            )
+
+            average_objective = float(
+                np.mean(
+                    [
+                        stat[
+                            "policy_objective"
+                        ]
+                        for stat in policy_stats
+                    ]
+                )
+            )
+
+        else:
+            average_kl = 0.0
+            average_objective = 0.0
+
+        return {
+            "detector_loss": detector_loss,
+            "agent2_kl": average_kl,
+            "agent2_objective": average_objective,
+        }
+
+    def _class_centroids(
+        self,
+    ) -> Dict[
+        int,
+        np.ndarray,
+    ]:
+        representations, _, _ = self.detector_components(
+            self.X_train[
+                self.labeled_idx
+            ]
+        )
+
+        labels = self.y_train[
+            self.labeled_idx
+        ]
+
+        centroids = {}
+
+        for class_id in [
+            0,
+            1,
+        ]:
+            class_representations = representations[
+                labels
+                == class_id
+            ]
+
+            if len(
+                class_representations
+            ) == 0:
+                raise RuntimeError(
+                    f"No labeled examples are available for class {class_id}."
+                )
+
+            centroids[
+                class_id
+            ] = class_representations.mean(
+                axis=0
+            )
+
+        return centroids
+
+    def _uncertainty(
+        self,
+        representation: np.ndarray,
+        centroids: Dict[
+            int,
+            np.ndarray,
+        ],
+    ) -> float:
+        temperature = float(
+            self.config[
+                "affinity_temperature"
+            ]
+        )
+
+        distances = np.array(
+            [
+                np.sum(
+                    (
+                        representation
+                        - centroids[
+                            class_id
+                        ]
+                    )
+                    ** 2
+                )
+                for class_id in [
+                    0,
+                    1,
+                ]
+            ],
+            dtype=np.float64,
+        )
+
+        logits = (
+            -distances
+            / max(
+                temperature,
+                self.settings.epsilon,
+            )
+        )
+
+        logits -= logits.max()
+
+        affinity = np.exp(
+            logits
+        )
+
+        affinity /= (
+            affinity.sum()
+            + self.settings.epsilon
+        )
+
+        return float(
+            -np.sum(
+                affinity
+                * np.log(
+                    affinity
+                    + self.settings.epsilon
+                )
+            )
+        )
+
+    def _agent1_state(
+        self,
+        representation: np.ndarray,
+        attack_probability: float,
+    ) -> np.ndarray:
+        return np.concatenate(
+            [
+                representation.astype(
+                    np.float32
+                ),
+                np.array(
+                    [
+                        attack_probability
+                    ],
+                    dtype=np.float32,
+                ),
+            ]
+        )
+
+    def acquisition_round(
+        self,
+        epoch: int,
+        total_epochs: int,
+        homotopy_rho: float,
+    ) -> Dict[
+        str,
+        float,
+    ]:
+        if (
+            not self.use_active_learning
+            or len(
+                self.unlabeled_idx
+            ) == 0
+        ):
+            return {
+                "annotations": 0.0,
+                "agent1_kl": 0.0,
+                "agent1_objective": 0.0,
+            }
+
+        total_budget = min(
+            int(
+                self.config[
+                    "annotation_budget"
+                ]
+            ),
+            len(
+                self.X_train
+            ),
+        )
+
+        remaining_budget = max(
+            0,
+            total_budget
+            - self.annotation_count,
+        )
+
+        if remaining_budget == 0:
+            return {
+                "annotations": 0.0,
+                "agent1_kl": 0.0,
+                "agent1_objective": 0.0,
+            }
+
+      
+        remaining_epochs = max(
+            total_epochs
+            - epoch,
+            1,
+        )
+
+        round_query_cap = max(
+            1,
+            math.ceil(
+                remaining_budget
+                / remaining_epochs
+            ),
+        )
+
+        candidates = (
+            self.unlabeled_idx
+            .copy()
+        )
+
+        self.rng.shuffle(
+            candidates
+        )
+
+       
+        candidates = candidates[
+            :
+            min(
+                len(
+                    candidates
+                ),
+                int(
+                    self.config[
+                        "agent1_batch_size"
+                    ]
+                ),
+            )
+        ]
+
+        centroids = self._class_centroids()
+
+        trajectory = TrajectoryBuffer()
+
+        annotations_this_round = 0
+
+        for position, sample_index in enumerate(
+            candidates
+        ):
+            (
+                representation,
+                _,
+                probability,
+            ) = self.detector_components(
+                self.X_train[
+                    sample_index:
+                    sample_index + 1
+                ],
+                batch_size=1,
+            )
+
+            representation = representation[
+                0
+            ]
+
+            attack_probability = float(
+                probability[0]
+            )
+
+            state = self._agent1_state(
+                representation,
+                attack_probability,
+            )
+
+            uncertainty = self._uncertainty(
+                representation,
+                centroids,
+            )
+
+            uncertainty_threshold = (
+                float(
+                    self.config[
+                        "initial_uncertainty_threshold"
+                    ]
+                )
+                * math.exp(
+                    -float(
+                        self.config[
+                            "threshold_decay"
+                        ]
+                    )
+                    * self.al_global_step
+                )
+            )
+
+            action_mask = np.array(
+                [
+                    True,
+                    self.annotation_count
+                    < total_budget,
+                ],
+                dtype=bool,
+            )
+
+            action = self.agent1.act(
+                state,
+                action_mask,
+                deterministic=False,
+            )
+
+            if (
+                action == 1
+                and self.annotation_count
+                < total_budget
+            ):
+                before_ba = self.validation_ba()
+
+                self.labeled_idx = np.append(
+                    self.labeled_idx,
+                    sample_index,
+                ).astype(
+                    int
+                )
+
+                self.unlabeled_idx = self.unlabeled_idx[
+                    self.unlabeled_idx
+                    != sample_index
+                ]
+
+                self.annotation_count += 1
+
+                annotations_this_round += 1
+
+                self.train_detector(
+                    epochs=self.settings.detector_update_epochs_after_annotation
+                )
+
+                centroids = self._class_centroids()
+
+                after_ba = self.validation_ba()
+
+                reward = (
+                    after_ba
+                    - before_ba
+                    - float(
+                        self.config[
+                            "annotation_cost"
+                        ]
+                    )
+                )
+
+            else:
+                skip_magnitude = float(
+                    self.config[
+                        "skip_reward"
+                    ]
+                )
+
+                reward = (
+                    skip_magnitude
+                    if uncertainty
+                    <= uncertainty_threshold
+                    else -skip_magnitude
+                )
+
+            self.al_global_step += 1
+
+            next_state = np.zeros_like(
+                state
+            )
+
+            done = False
+
+            if (
+                position + 1
+                < len(candidates)
+                and annotations_this_round
+                < round_query_cap
+            ):
+                next_index = candidates[
+                    position + 1
+                ]
+
+                remaining_unlabeled = set(
+                    self.unlabeled_idx.tolist()
+                )
+
+                if (
+                    next_index
+                    in remaining_unlabeled
+                ):
+                    (
+                        next_representation,
+                        _,
+                        next_probability,
+                    ) = self.detector_components(
+                        self.X_train[
+                            next_index:
+                            next_index + 1
+                        ],
+                        batch_size=1,
+                    )
+
+                    next_state = self._agent1_state(
+                        next_representation[
+                            0
+                        ],
+                        float(
+                            next_probability[
+                                0
+                            ]
+                        ),
+                    )
+
+            else:
+                done = True
+
+            trajectory.add(
+                state,
+                action,
+                reward,
+                next_state,
+                done,
+                action_mask,
+            )
+
+            if (
+                annotations_this_round
+                >= round_query_cap
+                or self.annotation_count
+                >= total_budget
+                or len(
+                    self.unlabeled_idx
+                ) == 0
+            ):
+                break
+
+        if len(
+            trajectory
+        ) >= 2:
+            stats = self.agent1.update(
+                trajectory,
+                homotopy_rho=homotopy_rho,
+            )
+
+        else:
+            stats = {
+                "max_kl": 0.0,
+                "policy_objective": 0.0,
+            }
+
+        return {
+            "annotations": float(
+                annotations_this_round
+            ),
+            "agent1_kl": float(
+                stats.get(
+                    "max_kl",
+                    0.0,
+                )
+            ),
+            "agent1_objective": float(
+                stats.get(
+                    "policy_objective",
+                    0.0,
+                )
+            ),
+        }
+
+    def fit(
+        self,
+        epochs: int,
+        homotopy_rho: float = 1.0,
+        verbose: bool = False,
+    ) -> None:
+        epochs = max(
+            1,
+            int(
+                epochs
+            ),
+        )
+
+        self.train_detector(
+            epochs=1
+        )
+
+        for epoch in range(
+            epochs
+        ):
+            agent2_stats = self.train_agent2_epoch(
+                homotopy_rho=homotopy_rho
+            )
+
+            agent1_stats = self.acquisition_round(
+                epoch,
+                epochs,
+                homotopy_rho=homotopy_rho,
+            )
+
+            record = {
+                "epoch": epoch + 1,
+                **agent2_stats,
+                **agent1_stats,
+                "labeled_size": len(
+                    self.labeled_idx
+                ),
+            }
+
+            self.history.append(
+                record
+            )
+
+            if verbose:
+                print(
+                    json.dumps(
+                        json_safe(
+                            record
+                        )
+                    )
+                )
+
+    def predict(
+        self,
+        X: np.ndarray,
+        deterministic: bool = True,
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+    ]:
+        X = np.asarray(
+            X,
+            dtype=np.float32,
+        )
+
+        probabilities = np.zeros(
+            len(X),
+            dtype=np.float32,
+        )
+
+        masks = np.zeros(
+            (
+                len(X),
+                self.num_features,
+            ),
+            dtype=bool,
+        )
+
+        for index, x in enumerate(
+            X
+        ):
+            (
+                representation,
+                scores,
+                _,
+            ) = self.detector_components(
+                x[
+                    None,
+                    :
+                ],
+                batch_size=1,
+            )
+
+            representation = representation[
+                0
+            ]
+
+            scores = scores[
+                0
+            ]
+
+            active = np.zeros(
+                self.num_features,
+                dtype=bool,
+            )
+
+            if self.use_feature_selection:
+                for _ in range(
+                    self.num_features
+                    + 1
+                ):
+                    state = self._agent2_state(
+                        representation,
+                        scores,
+                        active,
+                    )
+
+                    can_select = np.any(
+                        ~active
+                    )
+
+                    action_mask = np.array(
+                        [
+                            can_select,
+                            True,
+                        ],
+                        dtype=bool,
+                    )
+
+                    action = self.agent2.act(
+                        state,
+                        action_mask,
+                        deterministic=deterministic,
+                    )
+
+                    if (
+                        action == 0
+                        and can_select
+                    ):
+                        unselected = np.flatnonzero(
+                            ~active
+                        )
+
+                        best_feature = int(
+                            unselected[
+                                np.argmax(
+                                    scores[
+                                        unselected
+                                    ]
+                                )
+                            ]
+                        )
+
+                        active[
+                            best_feature
+                        ] = True
+
+                    else:
+                        break
+
+            else:
+                active[:] = True
+
+            probabilities[
+                index
+            ] = self.detector_probabilities(
+                x[
+                    None,
+                    :
+                ],
+                active.astype(
+                    np.float32
+                ),
+            )[0]
+
+            masks[
+                index
+            ] = active
+
+        return (
+            probabilities,
+            masks,
+        )
+
+    def evaluate(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+    ) -> Dict[
+        str,
+        float,
+    ]:
+        probabilities, masks = self.predict(
+            X,
+            deterministic=True,
+        )
+
+        metrics = evaluate_binary(
+            y,
+            probabilities,
+            threshold=0.5,
+        )
+
+        metrics[
+            "mean_selected_features"
+        ] = float(
+            masks
+            .sum(
+                axis=1
+            )
+            .mean()
+        )
+
+        metrics[
+            "annotation_count"
+        ] = int(
+            self.annotation_count
+        )
+
+        metrics[
+            "final_labeled_size"
+        ] = int(
+            len(
+                self.labeled_idx
+            )
+        )
+
+        return metrics
+
+    def save(
+        self,
+        output_dir: Path,
+        preprocessor: LeakageSafePreprocessor,
+        metrics: Dict[
+            str,
+            float,
+        ],
+    ) -> None:
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        torch.save(
+            {
+                "detector": self.detector.state_dict(),
+                "agent1_policy": self.agent1.policy.state_dict(),
+                "agent1_value": self.agent1.value.state_dict(),
+                "agent2_policy": self.agent2.policy.state_dict(),
+                "agent2_value": self.agent2.value.state_dict(),
+                "config": self.config,
+                "feature_names": self.feature_names,
+                "fixed_settings": asdict(
+                    self.settings
+                ),
+            },
+            output_dir
+            / "model.pt",
+        )
+
+        joblib.dump(
+            preprocessor,
+            output_dir
+            / "preprocessor.joblib",
+        )
+
+        with open(
+            output_dir
+            / "metrics.json",
+            "w",
+            encoding="utf-8",
+        ) as output_file:
+            json.dump(
+                json_safe(
+                    metrics
+                ),
+                output_file,
+                indent=2,
+            )
+
+        with open(
+            output_dir
+            / "training_history.json",
+            "w",
+            encoding="utf-8",
+        ) as output_file:
+            json.dump(
+                json_safe(
+                    self.history
+                ),
+                output_file,
+                indent=2,
+            )
+
+
+def build_configspace(
+    seed: int,
+):
+    try:
+        import ConfigSpace as CS
+
+        import ConfigSpace.hyperparameters as CSH
+
+    except ImportError as exc:
+        raise ImportError(
+            "ConfigSpace is required for the paper BOHB pipeline. "
+            "Install ConfigSpace==0.7.*."
+        ) from exc
+
+    config_space = CS.ConfigurationSpace(
+        seed=seed
+    )
+
+    hyperparameters = [
+        CSH.UniformIntegerHyperparameter(
+            "agent1_batch_size",
+            lower=32,
+            upper=1024,
+            log=True,
+        ),
+        CSH.UniformIntegerHyperparameter(
+            "agent2_batch_size",
+            lower=32,
+            upper=1024,
+            log=True,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "agent1_learning_rate",
+            lower=1e-4,
+            upper=5e-2,
+            log=True,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "agent2_learning_rate",
+            lower=1e-4,
+            upper=5e-2,
+            log=True,
+        ),
+        CSH.CategoricalHyperparameter(
+            "agent1_activation",
+            choices=PAPER_SEARCH_SPACE[
+                "activation"
+            ],
+        ),
+        CSH.CategoricalHyperparameter(
+            "agent2_activation",
+            choices=PAPER_SEARCH_SPACE[
+                "activation"
+            ],
+        ),
+        CSH.UniformFloatHyperparameter(
+            "agent1_dropout",
+            lower=0.0,
+            upper=0.7,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "agent2_dropout",
+            lower=0.0,
+            upper=0.7,
+        ),
+        CSH.UniformIntegerHyperparameter(
+            "training_epochs",
+            lower=16,
+            upper=1024,
+            log=True,
+        ),
+        CSH.UniformIntegerHyperparameter(
+            "lstm_layers",
+            lower=1,
+            upper=8,
+        ),
+        CSH.UniformIntegerHyperparameter(
+            "mlp_layers",
+            lower=1,
+            upper=8,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "affinity_temperature",
+            lower=0.1,
+            upper=2.0,
+            log=True,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "annotation_cost",
+            lower=0.0,
+            upper=1.0,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "skip_reward",
+            lower=0.0,
+            upper=1.0,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "initial_uncertainty_threshold",
+            lower=0.1,
+            upper=1.0,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "threshold_decay",
+            lower=1e-4,
+            upper=0.1,
+            log=True,
+        ),
+        CSH.UniformIntegerHyperparameter(
+            "annotation_budget",
+            lower=100,
+            upper=5000,
+            log=True,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "feature_relevance_weight",
+            lower=0.0,
+            upper=1.0,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "subset_complexity_weight",
+            lower=0.0,
+            upper=1.0,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "validation_improvement_weight",
+            lower=0.0,
+            upper=1.0,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "agent1_entropy_coefficient",
+            lower=1e-4,
+            upper=0.1,
+            log=True,
+        ),
+        CSH.UniformFloatHyperparameter(
+            "agent2_entropy_coefficient",
+            lower=1e-4,
+            upper=0.1,
+            log=True,
+        ),
+    ]
+
+    config_space.add_hyperparameters(
+        hyperparameters
+    )
+
+    return config_space
+
+
+def homotopy_bohb_search(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    feature_names: Sequence[str],
+    settings: FixedSettings,
+    seed: int,
+    working_dir: Path,
+) -> Tuple[
+    Dict,
+    List[
+        Dict
+    ],
+]:
+    try:
+        import hpbandster.core.nameserver as hpns
+
+        from hpbandster.core.worker import Worker
+
+        from hpbandster.optimizers import BOHB
+
+    except ImportError as exc:
+        raise ImportError(
+            "HPBandSter is required for the paper BOHB pipeline. "
+            "Install hpbandster==0.7.4."
+        ) from exc
+
+    config_space = build_configspace(
+        seed
+    )
+
+    working_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    all_records: List[
+        Dict
+    ] = []
+
+    previous_result = None
+    final_result = None
+    final_rho = 1.0
+
+    class PaperWorker(
+        Worker
+    ):
+        def __init__(
+            self,
+            *args,
+            rho: float,
+            **kwargs,
+        ):
+            super().__init__(
+                *args,
+                **kwargs,
+            )
+
+            self.rho = float(
+                rho
+            )
+
+        def compute(
+            self,
+            config,
+            budget,
+            **kwargs,
+        ):
+            del kwargs
+
+            candidate_config = dict(
+                config
+            )
+
+            set_seed(
+                seed
+            )
+
+           
+            effective_epochs = min(
+                int(
+                    candidate_config[
+                        "training_epochs"
+                    ]
+                ),
+                max(
+                    1,
+                    int(
+                        round(
+                            float(
+                                budget
+                            )
+                        )
+                    ),
+                ),
+            )
+
+            model = DualAgentFramework(
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                feature_names=feature_names,
+                config=candidate_config,
+                settings=settings,
+                seed=seed,
+            )
+
+            model.fit(
+                effective_epochs,
+                homotopy_rho=self.rho,
+                verbose=False,
+            )
+
+            validation_probability, _ = model.predict(
+                X_val,
+                deterministic=True,
+            )
+
+            validation_ba = balanced_accuracy_score(
+                y_val,
+                (
+                    validation_probability
+                    >= 0.5
+                ).astype(
+                    int
+                ),
+            )
+
+            loss = (
+                1.0
+                - float(
+                    validation_ba
+                )
+            )
+
+            info = {
+                "balanced_accuracy": float(
+                    validation_ba
+                ),
+                "rho": self.rho,
+                "budget": float(
+                    budget
+                ),
+                "effective_epochs": effective_epochs,
+                "config": json_safe(
+                    candidate_config
+                ),
+            }
+
+            all_records.append(
+                {
+                    "loss": loss,
+                    **info,
+                }
+            )
+
+            return {
+                "loss": loss,
+                "info": info,
+            }
+
+    rho_values = np.linspace(
+        0.0,
+        1.0,
+        settings.homotopy_stage_count,
+    )
+
+    for stage_index, rho in enumerate(
+        rho_values
+    ):
+        run_id = (
+            f"homotopy_{seed}_"
+            f"{stage_index}_"
+            f"{int(time.time() * 1e6) % 1000000}"
+        )
+
+        stage_dir = (
+            working_dir
+            / f"stage_{stage_index:02d}"
+        )
+
+        stage_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        nameserver = hpns.NameServer(
+            run_id=run_id,
+            host="127.0.0.1",
+            port=0,
+            working_directory=str(
+                stage_dir
+            ),
+        )
+
+        nameserver_host, nameserver_port = (
+            nameserver.start()
+        )
+
+        worker = PaperWorker(
+            rho=float(
+                rho
+            ),
+            run_id=run_id,
+            host="127.0.0.1",
+            nameserver=nameserver_host,
+            nameserver_port=nameserver_port,
+            timeout=120,
+        )
+
+        worker.run(
+            background=True
+        )
+
+        optimizer = BOHB(
+            configspace=config_space,
+            run_id=run_id,
+            host="127.0.0.1",
+            nameserver=nameserver_host,
+            nameserver_port=nameserver_port,
+            min_budget=settings.bohb_min_budget,
+            max_budget=settings.bohb_max_budget,
+            eta=settings.bohb_eta,
+            previous_result=previous_result,
+        )
+
+        try:
+            final_result = optimizer.run(
+                n_iterations=settings.bohb_iterations_per_stage
+            )
+
+        finally:
+            optimizer.shutdown(
+                shutdown_workers=True
+            )
+
+            nameserver.shutdown()
+
+        previous_result = (
+            final_result
+        )
+
+        final_rho = float(
+            rho
+        )
+
+    if final_result is None:
+        raise RuntimeError(
+            "Homotopy-BOHB did not produce a result."
+        )
+
+    id_to_config = (
+        final_result
+        .get_id2config_mapping()
+    )
+
+    candidate_runs = []
+
+    for run in final_result.get_all_runs():
+        info = (
+            run.info
+            or {}
+        )
+
+        if run.loss is None:
+            continue
+
+        if abs(
+            float(
+                info.get(
+                    "rho",
+                    -1.0,
+                )
+            )
+            - final_rho
+        ) < 1e-12:
+            candidate_runs.append(
+                run
+            )
+
+    if not candidate_runs:
+        incumbent_id = (
+            final_result
+            .get_incumbent_id()
+        )
+
+        best_config = dict(
+            id_to_config[
+                incumbent_id
+            ][
+                "config"
+            ]
+        )
+
+    else:
+        maximum_budget = max(
+            float(
+                run.budget
+            )
+            for run in candidate_runs
+        )
+
+        high_budget_runs = [
+            run
+            for run in candidate_runs
+            if abs(
+                float(
+                    run.budget
+                )
+                - maximum_budget
+            ) < 1e-12
+        ]
+
+        best_run = min(
+            high_budget_runs,
+            key=lambda run: float(
+                run.loss
+            ),
+        )
+
+        best_config = dict(
+            id_to_config[
+                best_run.config_id
+            ][
+                "config"
+            ]
+        )
+
+    with open(
+        working_dir
+        / "bohb_records.json",
+        "w",
+        encoding="utf-8",
+    ) as output_file:
+        json.dump(
+            json_safe(
+                all_records
+            ),
+            output_file,
+            indent=2,
+        )
+
+    with open(
+        working_dir
+        / "best_config.json",
+        "w",
+        encoding="utf-8",
+    ) as output_file:
+        json.dump(
+            json_safe(
+                best_config
+            ),
+            output_file,
+            indent=2,
+        )
+
+    return (
+        best_config,
+        all_records,
+    )
+
+
+def aggregate_runs(
+    run_metrics: List[
+        Dict[
+            str,
+            float,
+        ]
+    ],
+) -> Dict[
+    str,
+    Dict[
+        str,
+        float,
+    ],
+]:
+    scalar_keys = [
+        "accuracy",
+        "sensitivity",
+        "f_measure",
+        "balanced_accuracy",
+        "mcc",
+        "precision",
+        "specificity",
+        "fpr",
+        "fnr",
+        "roc_auc",
+        "pr_auc",
+        "mean_selected_features",
+        "annotation_count",
+        "final_labeled_size",
+    ]
+
+    result = {}
+
+    for key in scalar_keys:
+        values = np.asarray(
+            [
+                metric[
+                    key
+                ]
+                for metric in run_metrics
+                if (
+                    key in metric
+                    and np.isfinite(
+                        metric[
+                            key
+                        ]
+                    )
+                )
+            ],
+            dtype=float,
+        )
+
+        if len(
+            values
+        ):
+            result[
+                key
+            ] = {
+                "mean": float(
+                    values.mean()
+                ),
+                "std": (
+                    float(
+                        values.std(
+                            ddof=1
+                        )
+                    )
+                    if len(values) > 1
+                    else 0.0
+                ),
+                "values": values.tolist(),
+            }
+
+    return result
+
+
+def holm_bonferroni(
+    p_values: Dict[
+        str,
+        float,
+    ],
+    alpha: float = 0.05,
+) -> Dict[
+    str,
+    Dict[
+        str,
+        float,
+    ],
+]:
+    items = sorted(
+        p_values.items(),
+        key=lambda item: item[1],
+    )
+
+    total_tests = len(
+        items
+    )
+
+    adjusted = {}
+    running_maximum = 0.0
+
+    for rank, (
+        name,
+        p_value,
+    ) in enumerate(
+        items,
+        start=1,
+    ):
+        adjusted_p = min(
+            1.0,
+            (
+                total_tests
+                - rank
+                + 1
+            )
+            * p_value,
+        )
+
+        running_maximum = max(
+            running_maximum,
+            adjusted_p,
+        )
+
+        adjusted[
+            name
+        ] = {
+            "raw_p": float(
+                p_value
+            ),
+            "holm_adjusted_p": float(
+                running_maximum
+            ),
+            "significant": bool(
+                running_maximum
+                < alpha
+            ),
+        }
+
+    return adjusted
+
+
+def paired_statistical_analysis(
+    proposed_metrics: List[
+        Dict[
+            str,
+            float,
+        ]
+    ],
+    baseline_results_path: str,
+    alpha: float = 0.05,
+) -> Dict:
+    with open(
+        baseline_results_path,
+        "r",
+        encoding="utf-8",
+    ) as input_file:
+        baselines = json.load(
+            input_file
+        )
+
+    output = {}
+
+    metric_names = [
+        "accuracy",
+        "sensitivity",
+        "f_measure",
+        "balanced_accuracy",
+        "mcc",
+    ]
+
+    for metric in metric_names:
+        proposed = np.asarray(
+            [
+                result[
+                    metric
+                ]
+                for result in proposed_metrics
+            ],
+            dtype=float,
+        )
+
+        p_values = {}
+        test_values = {}
+
+        for baseline_name, baseline_data in baselines.items():
+            if metric not in baseline_data:
+                continue
+
+            baseline = np.asarray(
+                baseline_data[
+                    metric
+                ],
+                dtype=float,
+            )
+
+            if len(
+                baseline
+            ) != len(
+                proposed
+            ):
+                raise ValueError(
+                    f"Baseline '{baseline_name}' metric '{metric}' "
+                    f"has {len(baseline)} runs; the proposed model "
+                    f"has {len(proposed)} runs."
+                )
+
+            differences = (
+                proposed
+                - baseline
+            )
+
+            mean_difference = float(
+                np.mean(
+                    differences
+                )
+            )
+
+            sd_difference = (
+                float(
+                    np.std(
+                        differences,
+                        ddof=1,
+                    )
+                )
+                if len(
+                    differences
+                ) > 1
+                else 0.0
+            )
+
+            t_statistic, p_value = ttest_rel(
+                proposed,
+                baseline,
+                alternative="two-sided",
+            )
+
+            p_values[
+                baseline_name
+            ] = float(
+                p_value
+            )
+
+            if sd_difference > 0:
+                cohens_d = (
+                    mean_difference
+                    / sd_difference
+                )
+
+            elif mean_difference > 0:
+                cohens_d = float(
+                    "inf"
+                )
+
+            elif mean_difference < 0:
+                cohens_d = float(
+                    "-inf"
+                )
+
+            else:
+                cohens_d = 0.0
+
+            test_values[
+                baseline_name
+            ] = {
+                "t_statistic": float(
+                    t_statistic
+                ),
+                "mean_difference": mean_difference,
+                "sd_difference": sd_difference,
+                "cohens_d": float(
+                    cohens_d
+                ),
+            }
+
+            if len(
+                differences
+            ) > 1:
+                critical_value = float(
+                    student_t.ppf(
+                        0.975,
+                        df=(
+                            len(
+                                differences
+                            )
+                            - 1
+                        ),
+                    )
+                )
+
+                half_width = (
+                    critical_value
+                    * sd_difference
+                    / math.sqrt(
+                        len(
+                            differences
+                        )
+                    )
+                )
+
+                test_values[
+                    baseline_name
+                ][
+                    "ci95_low"
+                ] = (
+                    mean_difference
+                    - half_width
+                )
+
+                test_values[
+                    baseline_name
+                ][
+                    "ci95_high"
+                ] = (
+                    mean_difference
+                    + half_width
+                )
+
+            else:
+                test_values[
+                    baseline_name
+                ][
+                    "ci95_low"
+                ] = float(
+                    "nan"
+                )
+
+                test_values[
+                    baseline_name
+                ][
+                    "ci95_high"
+                ] = float(
+                    "nan"
+                )
+
+        corrected = holm_bonferroni(
+            p_values,
+            alpha=alpha,
+        )
+
+        for baseline_name in corrected:
+            corrected[
+                baseline_name
+            ].update(
+                test_values[
+                    baseline_name
+                ]
+            )
+
+        output[
+            metric
+        ] = corrected
+
+    return output
+
+
+def parse_seed_list(
+    text: str,
+) -> List[int]:
+    values = [
+        int(
+            value.strip()
+        )
+        for value in text.split(
+            ","
+        )
+        if value.strip()
+    ]
+
+    if not values:
+        raise ValueError(
+            "At least one random seed is required."
+        )
+
+    return values
+
+
+def run_one_seed(
+    X_raw: pd.DataFrame,
+    y: np.ndarray,
+    seed: int,
+    settings: FixedSettings,
+    output_dir: Path,
+    run_hpo: bool,
+    fixed_config_path: Optional[
+        str
+    ],
+) -> Dict[
+    str,
+    float,
+]:
+    set_seed(
+        seed
+    )
+
+    (
+        X_train_raw,
+        X_val_raw,
+        X_test_raw,
+        y_train,
+        y_val,
+        y_test,
+    ) = stratified_split_raw(
+        X_raw,
+        y,
+        seed,
+    )
+
+    preprocessor = LeakageSafePreprocessor(
+        settings.clip_lower_quantile,
+        settings.clip_upper_quantile,
+    )
+
+    X_train = preprocessor.fit_transform(
+        X_train_raw
+    )
+
+    X_val = preprocessor.transform(
+        X_val_raw
+    )
+
+    X_test = preprocessor.transform(
+        X_test_raw
+    )
+
+    feature_names = (
+        preprocessor
+        .get_feature_names()
+    )
+
+    seed_dir = (
+        output_dir
+        / f"seed_{seed}"
+    )
+
+    seed_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if run_hpo:
+        best_config, _ = homotopy_bohb_search(
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            feature_names=feature_names,
+            settings=settings,
+            seed=seed,
+            working_dir=(
+                seed_dir
+                / "homotopy_bohb"
+            ),
+        )
+
+    else:
+        if not fixed_config_path:
+            raise ValueError(
+                "--skip-hpo requires --fixed-config containing a "
+                "previously optimized configuration."
+            )
+
+        with open(
+            fixed_config_path,
+            "r",
+            encoding="utf-8",
+        ) as input_file:
+            best_config = json.load(
+                input_file
+            )
+
+    final_model = DualAgentFramework(
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val,
+        feature_names=feature_names,
+        config=best_config,
+        settings=settings,
+        seed=seed,
+    )
+
+  
+    final_epochs = int(
+        best_config[
+            "training_epochs"
+        ]
+    )
+
+    final_model.fit(
+        final_epochs,
+        homotopy_rho=1.0,
+        verbose=False,
+    )
+
+    test_metrics = final_model.evaluate(
+        X_test,
+        y_test,
+    )
+
+    test_metrics[
+        "seed"
+    ] = seed
+
+    final_model.save(
+        seed_dir,
+        preprocessor,
+        test_metrics,
+    )
+
+    with open(
+        seed_dir
+        / "best_config.json",
+        "w",
+        encoding="utf-8",
+    ) as output_file:
+        json.dump(
+            json_safe(
+                best_config
+            ),
+            output_file,
+            indent=2,
+        )
+
+    return test_metrics
+
+
+def build_arg_parser(
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Complete single-file implementation of the "
+            "dual-agent ER-TRPO DDoS framework."
+        )
+    )
+
+    parser.add_argument(
+        "--dataset",
+        required=True,
+        choices=[
+            "kddcup99",
+            "iscx-unb",
+            "darpa",
+            "cicddos",
+        ],
+    )
+
+    parser.add_argument(
+        "--data-path",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--label-column",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default="./dual_agent_ddos_results",
+    )
+
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--seeds",
+        default="42,123,2024,3407,5189",
+    )
+
+    parser.add_argument(
+        "--skip-hpo",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--fixed-config",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--baseline-results",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--cicflowmeter-command",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--clip-lower-quantile",
+        type=float,
+        default=0.01,
+    )
+
+    parser.add_argument(
+        "--clip-upper-quantile",
+        type=float,
+        default=0.99,
+    )
+
+    parser.add_argument(
+        "--initial-labeled-fraction",
+        type=float,
+        default=0.10,
+    )
+
+    parser.add_argument(
+        "--lstm-hidden-size",
+        type=int,
+        default=128,
+    )
+
+    parser.add_argument(
+        "--policy-hidden-size",
+        type=int,
+        default=128,
+    )
+
+    parser.add_argument(
+        "--value-hidden-size",
+        type=int,
+        default=128,
+    )
+
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.99,
+    )
+
+    parser.add_argument(
+        "--n-step",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument(
+        "--kl-delta",
+        type=float,
+        default=0.01,
+    )
+
+    parser.add_argument(
+        "--cg-iterations",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
+        "--cg-damping",
+        type=float,
+        default=0.10,
+    )
+
+    parser.add_argument(
+        "--line-search-steps",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
+        "--line-search-backtrack",
+        type=float,
+        default=0.5,
+    )
+
+    parser.add_argument(
+        "--value-iterations",
+        type=int,
+        default=20,
+    )
+
+    parser.add_argument(
+        "--detector-update-epochs-after-annotation",
+        type=int,
+        default=1,
+    )
+
+    parser.add_argument(
+        "--homotopy-stage-count",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument(
+        "--bohb-iterations-per-stage",
+        type=int,
+        default=3,
+    )
+
+    parser.add_argument(
+        "--bohb-eta",
+        type=int,
+        default=3,
+    )
+
+    parser.add_argument(
+        "--lime-num-samples",
+        type=int,
+        default=512,
+    )
+
+    parser.add_argument(
+        "--lime-kernel-width",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--validation-reward-max-samples",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--device",
+        default=(
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        ),
+    )
+
+    return parser
+
+
+def main() -> None:
+    args = (
+        build_arg_parser()
+        .parse_args()
+    )
+
+    output_dir = Path(
+        args.output_dir
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    settings = FixedSettings(
+        clip_lower_quantile=args.clip_lower_quantile,
+        clip_upper_quantile=args.clip_upper_quantile,
+        initial_labeled_fraction=args.initial_labeled_fraction,
+        lstm_hidden_size=args.lstm_hidden_size,
+        policy_hidden_size=args.policy_hidden_size,
+        value_hidden_size=args.value_hidden_size,
+        gamma=args.gamma,
+        n_step=args.n_step,
+        kl_delta=args.kl_delta,
+        cg_iterations=args.cg_iterations,
+        cg_damping=args.cg_damping,
+        line_search_steps=args.line_search_steps,
+        line_search_backtrack=args.line_search_backtrack,
+        value_iterations=args.value_iterations,
+        detector_update_epochs_after_annotation=(
+            args.detector_update_epochs_after_annotation
+        ),
+        homotopy_stage_count=args.homotopy_stage_count,
+        bohb_iterations_per_stage=args.bohb_iterations_per_stage,
+        bohb_eta=args.bohb_eta,
+        lime_num_samples=args.lime_num_samples,
+        lime_kernel_width=args.lime_kernel_width,
+        validation_reward_max_samples=(
+            args.validation_reward_max_samples
+        ),
+        device=args.device,
+    )
+
+    data_path = Path(
+        args.data_path
+    )
+
+    aligned_path = run_cicflowmeter_if_needed(
+        data_path=data_path,
+        command_template=args.cicflowmeter_command,
+        output_dir=(
+            output_dir
+            / "cicflowmeter_flows"
+        ),
+    )
+
+    dataframe = load_raw_dataset(
+        str(
+            aligned_path
+        ),
+        max_rows=args.max_rows,
+    )
+
+    label_column = infer_label_column(
+        dataframe,
+        args.label_column,
+    )
+
+    X_raw, y = clean_dataset(
+        dataframe,
+        label_column,
+    )
+
+    seeds = parse_seed_list(
+        args.seeds
+    )
+
+    with open(
+        output_dir
+        / "run_settings.json",
+        "w",
+        encoding="utf-8",
+    ) as output_file:
+        json.dump(
+            json_safe(
+                {
+                    "dataset": args.dataset,
+                    "data_path": str(
+                        data_path
+                    ),
+                    "label_column": str(
+                        label_column
+                    ),
+                    "seeds": seeds,
+                    "fixed_settings": asdict(
+                        settings
+                    ),
+                    "paper_search_space": PAPER_SEARCH_SPACE,
+                }
+            ),
+            output_file,
+            indent=2,
+        )
+
+    run_metrics = []
+
+    for seed in seeds:
+        metrics = run_one_seed(
+            X_raw=X_raw,
+            y=y,
+            seed=seed,
+            settings=settings,
+            output_dir=output_dir,
+            run_hpo=(
+                not args.skip_hpo
+            ),
+            fixed_config_path=args.fixed_config,
+        )
+
+        run_metrics.append(
+            metrics
+        )
+
+        print(
+            f"Seed {seed}: "
+            f"{json.dumps(json_safe(metrics), sort_keys=True)}"
+        )
+
+    aggregate = aggregate_runs(
+        run_metrics
+    )
+
+    with open(
+        output_dir
+        / "aggregate_metrics.json",
+        "w",
+        encoding="utf-8",
+    ) as output_file:
+        json.dump(
+            json_safe(
+                aggregate
+            ),
+            output_file,
+            indent=2,
+        )
+
+    print(
+        "\nMean ± standard deviation across independent runs:"
+    )
+
+    for metric, statistics in aggregate.items():
+        print(
+            f"{metric}: "
+            f"{statistics['mean']:.6f} "
+            f"± "
+            f"{statistics['std']:.6f}"
+        )
+
+    if args.baseline_results:
+        statistical_results = paired_statistical_analysis(
+            run_metrics,
+            args.baseline_results,
+            alpha=0.05,
+        )
+
+        with open(
+            output_dir
+            / "paired_statistics_holm.json",
+            "w",
+            encoding="utf-8",
+        ) as output_file:
+            json.dump(
+                json_safe(
+                    statistical_results
+                ),
+                output_file,
+                indent=2,
+            )
+
+        print(
+            "Paired two-sided t-tests, 95% confidence intervals, "
+            "Cohen's d values, and Holm-Bonferroni-adjusted p-values "
+            "were saved to paired_statistics_holm.json"
+        )
+
+
+if __name__ == "__main__":
+    main()
