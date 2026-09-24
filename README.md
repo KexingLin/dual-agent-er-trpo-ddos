@@ -50,7 +50,7 @@ The implementation includes the complete experimental pipeline described in the 
 
 The proposed architecture separates sample acquisition and attack detection into two coordinated reinforcement-learning agents.
 
-**Agent 1 – Active Learning Agent**
+#### Agent 1 – Active Learning Agent
 
 Agent 1 determines whether an unlabeled network-traffic instance should be requested for annotation.
 
@@ -67,9 +67,7 @@ The acquisition decision accounts for:
 - annotation cost,
 - and the resulting change in validation balanced accuracy.
 
----
-
-**Agent 2 – Feature Selection and Detection Agent**
+#### Agent 2 – Feature Selection and Detection Agent
 
 Agent 2 performs:
 
@@ -259,89 +257,107 @@ Hyperparameters
         │
         ▼
 Homotopy + BOHB Optimization
+```
 
-Datasets
+---
+
+## Datasets
 
 The framework supports the four benchmark datasets evaluated in the study:
 
-Dataset	Description
-KDDCup99	Benchmark intrusion-detection dataset containing normal traffic and several attack categories
-ISCX-UNB	Network-security dataset containing realistic benign and malicious traffic profiles
-DARPA	Dataset containing controlled multi-stage intrusion and DDoS attack scenarios
-CICDDoS	Modern DDoS traffic dataset containing legitimate traffic and multiple reflection/amplification attacks
+| Dataset | Description |
+|---|---|
+| **KDDCup99** | Benchmark intrusion-detection dataset containing normal traffic and several attack categories |
+| **ISCX-UNB** | Network-security dataset containing realistic benign and malicious traffic profiles |
+| **DARPA** | Dataset containing controlled multi-stage intrusion and DDoS attack scenarios |
+| **CICDDoS** | Modern DDoS traffic dataset containing legitimate traffic and multiple reflection/amplification attacks |
 
-The proposed methodology formulates the final detection problem as binary classification:
+The proposed methodology formulates the final detection problem as **binary classification**:
 
+```text
 0 → Benign / Normal traffic
 1 → Attack / DDoS traffic
+```
 
-Multiclass attack labels are therefore mapped to the attack class when necessary.
+Multiclass attack labels are mapped to the attack class when necessary.
 
-Data Preprocessing
+---
+
+## Data Preprocessing
 
 The implementation follows a leakage-safe preprocessing strategy.
 
 The complete dataset is divided into:
 
+```text
 Training   : 70%
 Validation : 15%
 Test       : 15%
+```
 
-All data-dependent preprocessing operations are fitted only on the training partition.
+All data-dependent preprocessing operations are fitted **only on the training partition**.
 
 The preprocessing pipeline includes:
 
-duplicate-record removal,
-incomplete-record removal,
-invalid/infinite-value filtering,
-percentile-based numerical clipping,
-categorical one-hot encoding,
-Min-Max normalization to [0, 1],
-fixed-dimensional tensor construction.
+1. duplicate-record removal,
+2. incomplete-record removal,
+3. invalid/infinite-value filtering,
+4. percentile-based numerical clipping,
+5. categorical one-hot encoding,
+6. Min-Max normalization to `[0, 1]`,
+7. fixed-dimensional tensor construction.
 
 The preprocessing parameters estimated from the training set are reused unchanged for validation and test data.
 
 This prevents information leakage from the validation and test partitions.
 
-Repository Structure
+---
 
-The repository intentionally uses a compact implementation structure.
+## Repository Structure
 
+```text
 dual-agent-er-trpo-ddos/
 │
 ├── dual_agent_er_trpo_ddos.py
 ├── README.md
 └── LICENSE
+```
 
 The complete methodological implementation is contained in:
 
+```text
 dual_agent_er_trpo_ddos.py
+```
 
 This includes:
 
-data loading,
-preprocessing,
-dataset splitting,
-LSTM-MLP detection,
-Agent 1,
-Agent 2,
-ER-TRPO,
-multi-step returns,
-LIME,
-imbalance-aware rewards,
-Active Learning,
-Homotopy continuation,
-BOHB optimization,
-model training,
-evaluation,
-statistical analysis,
-and model saving.
-Requirements
+- data loading,
+- preprocessing,
+- dataset splitting,
+- LSTM-MLP detection,
+- Agent 1,
+- Agent 2,
+- ER-TRPO,
+- multi-step returns,
+- LIME,
+- imbalance-aware rewards,
+- Active Learning,
+- Homotopy continuation,
+- BOHB optimization,
+- model training,
+- evaluation,
+- statistical analysis,
+- and model saving.
+
+---
+
+## Requirements
 
 The implementation is written in Python.
 
 Main dependencies include:
 
+```text
 Python
 NumPy
 Pandas
@@ -352,219 +368,293 @@ LIME
 ConfigSpace
 HPBandSter
 Joblib
+```
 
-A recent Python environment is recommended.
+Create a virtual environment:
 
-For example:
-
+```bash
 python -m venv venv
+```
 
-Activate the environment.
+Activate it on Linux/macOS:
 
-Linux / macOS
+```bash
 source venv/bin/activate
-Windows
+```
+
+Activate it on Windows:
+
+```bash
 venv\Scripts\activate
+```
 
 Install the required packages:
 
+```bash
 pip install numpy pandas torch scipy scikit-learn lime ConfigSpace hpbandster joblib
-Main Implementation File
+```
+
+---
+
+## Main Implementation File
 
 The main executable script is:
 
+```text
 dual_agent_er_trpo_ddos.py
+```
 
-The program contains a main() function and can be executed directly from the command line.
+The program contains a `main()` function and can be executed directly from the command line.
 
-Basic Usage
+---
+
+## Basic Usage
 
 General syntax:
 
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset DATASET_NAME \
     --data-path PATH_TO_DATASET
+```
 
 Supported dataset identifiers are:
 
+```text
 kddcup99
 iscx-unb
 darpa
 cicddos
-Example: KDDCup99
+```
+
+### KDDCup99
+
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset kddcup99 \
     --data-path ./data/kddcup99
-Example: CICDDoS
+```
+
+### CICDDoS
+
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset cicddos \
     --data-path ./data/cicddos \
     --label-column Label
-Example: ISCX-UNB
+```
+
+### ISCX-UNB
+
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset iscx-unb \
     --data-path ./data/iscx-unb \
     --label-column Label
-Example: DARPA
+```
+
+### DARPA
+
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset darpa \
     --data-path ./data/darpa \
     --label-column Label
-Label Column
+```
+
+---
+
+## Label Column
 
 The implementation attempts to automatically identify commonly used label-column names.
 
 If automatic detection is not possible, specify the column explicitly:
 
+```bash
 --label-column Label
+```
 
-For example:
+Example:
 
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset cicddos \
     --data-path ./data/cicddos.csv \
     --label-column Label
-PCAP Input and CICFlowMeter
+```
 
-If packet-capture files are provided instead of already extracted flow tables, the implementation can call an external CICFlowMeter command before training.
+---
+
+## PCAP Input and CICFlowMeter
+
+If packet-capture files are provided instead of already extracted flow tables, the implementation can call an external **CICFlowMeter** command before training.
 
 Example:
 
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset cicddos \
     --data-path ./pcaps \
     --cicflowmeter-command "YOUR_CICFLOWMETER_COMMAND {input} {output}"
+```
 
 The command template must contain:
 
+```text
 {input}
 {output}
+```
 
-which are replaced automatically with the input PCAP and generated flow-file paths.
+These placeholders are replaced automatically with the input PCAP and generated flow-file paths.
 
-Homotopy-BOHB Hyperparameter Optimization
+---
+
+## Homotopy-BOHB Hyperparameter Optimization
 
 Hyperparameter optimization is performed automatically unless explicitly disabled.
 
 The implemented search space includes:
 
-Hyperparameter	Search Range
-Agent 1 batch size	32 – 1024
-Agent 2 batch size	32 – 1024
-Agent 1 learning rate	1e-4 – 5e-2
-Agent 2 learning rate	1e-4 – 5e-2
-Activation function	Leaky ReLU, ReLU, Tanh, Linear, Sigmoid
-Agent 1 dropout	0.0 – 0.7
-Agent 2 dropout	0.0 – 0.7
-Training epochs	16 – 1024
-LSTM layers	1 – 8
-MLP layers	1 – 8
-Affinity temperature	0.1 – 2.0
-Annotation cost	0.0 – 1.0
-Skip reward coefficient	0.0 – 1.0
-Initial uncertainty threshold	0.1 – 1.0
-Threshold decay rate	1e-4 – 0.1
-Annotation budget	100 – 5000
-Feature relevance weight	0.0 – 1.0
-Subset complexity weight	0.0 – 1.0
-Validation improvement weight	0.0 – 1.0
-Agent 1 entropy coefficient	1e-4 – 0.1
-Agent 2 entropy coefficient	1e-4 – 0.1
+| Hyperparameter | Search Range |
+|---|---|
+| Agent 1 batch size | 32 – 1024 |
+| Agent 2 batch size | 32 – 1024 |
+| Agent 1 learning rate | `1e-4` – `5e-2` |
+| Agent 2 learning rate | `1e-4` – `5e-2` |
+| Activation function | Leaky ReLU, ReLU, Tanh, Linear, Sigmoid |
+| Agent 1 dropout | 0.0 – 0.7 |
+| Agent 2 dropout | 0.0 – 0.7 |
+| Training epochs | 16 – 1024 |
+| LSTM layers | 1 – 8 |
+| MLP layers | 1 – 8 |
+| Affinity temperature | 0.1 – 2.0 |
+| Annotation cost | 0.0 – 1.0 |
+| Skip reward coefficient | 0.0 – 1.0 |
+| Initial uncertainty threshold | 0.1 – 1.0 |
+| Threshold decay rate | `1e-4` – 0.1 |
+| Annotation budget | 100 – 5000 |
+| Feature relevance weight | 0.0 – 1.0 |
+| Subset complexity weight | 0.0 – 1.0 |
+| Validation improvement weight | 0.0 – 1.0 |
+| Agent 1 entropy coefficient | `1e-4` – 0.1 |
+| Agent 2 entropy coefficient | `1e-4` – 0.1 |
 
-The BOHB training-resource range is:
+The BOHB resource range is:
 
+```text
 Minimum budget : 10 epochs
 Maximum budget : 90 epochs
-Running Without Hyperparameter Optimization
+```
 
-A previously optimized configuration can be reused.
+---
 
+## Running Without Hyperparameter Optimization
+
+A previously optimized configuration can be reused:
+
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset kddcup99 \
     --data-path ./data/kddcup99 \
     --skip-hpo \
     --fixed-config ./best_config.json
+```
 
-This option is useful when:
+This option is useful for repeated evaluation or reproducing a previously optimized experiment.
 
-reproducing a previously optimized experiment,
-performing repeated-run evaluation,
-or avoiding repeated BOHB optimization.
-Repeated Runs
+---
+
+## Repeated Runs
 
 The implementation supports multiple independent random seeds.
 
 Example:
 
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset kddcup99 \
     --data-path ./data/kddcup99 \
     --seeds 42,123,2024,3407,5189
+```
 
 Results are reported individually and aggregated as:
 
+```text
 mean ± standard deviation
-Evaluation Metrics
+```
+
+---
+
+## Evaluation Metrics
 
 The final test-set evaluation includes:
 
-Accuracy
-Sensitivity / Recall
-F-measure / F1-score
-Balanced Accuracy
-Matthews Correlation Coefficient (MCC)
-Precision
-Specificity
-False Positive Rate (FPR)
-False Negative Rate (FNR)
-ROC-AUC
-PR-AUC
+- Accuracy
+- Sensitivity / Recall
+- F-measure / F1-score
+- Balanced Accuracy
+- Matthews Correlation Coefficient (MCC)
+- Precision
+- Specificity
+- False Positive Rate (FPR)
+- False Negative Rate (FNR)
+- ROC-AUC
+- PR-AUC
 
 The implementation additionally reports:
 
-mean number of selected features,
-number of acquired annotations,
-and final labeled-set size.
+- mean number of selected features,
+- number of acquired annotations,
+- and final labeled-set size.
 
 All metrics are computed from actual model predictions.
 
 No reported experimental result is hard-coded into the implementation.
 
-Statistical Evaluation
+---
+
+## Statistical Evaluation
 
 The implementation can perform paired statistical comparisons when repeated-run baseline results are available.
 
 Supported statistical analysis includes:
 
-paired two-sided t-test,
-95% confidence intervals,
-Cohen's d effect size,
-Holm-Bonferroni correction for multiple comparisons.
+- paired two-sided t-test,
+- 95% confidence intervals,
+- Cohen's d effect size,
+- Holm-Bonferroni correction for multiple comparisons.
 
 A baseline-results JSON file can be supplied using:
 
+```bash
 --baseline-results ./baseline_results.json
+```
 
 Example structure:
 
+```json
 {
-    "Baseline_A": {
-        "accuracy": [0.91, 0.92, 0.90, 0.93, 0.91],
-        "sensitivity": [0.90, 0.91, 0.89, 0.92, 0.90],
-        "f_measure": [0.90, 0.91, 0.89, 0.92, 0.90],
-        "balanced_accuracy": [0.90, 0.91, 0.89, 0.92, 0.90],
-        "mcc": [0.80, 0.82, 0.78, 0.84, 0.81]
-    }
+  "Baseline_A": {
+    "accuracy": [0.91, 0.92, 0.90, 0.93, 0.91],
+    "sensitivity": [0.90, 0.91, 0.89, 0.92, 0.90],
+    "f_measure": [0.90, 0.91, 0.89, 0.92, 0.90],
+    "balanced_accuracy": [0.90, 0.91, 0.89, 0.92, 0.90],
+    "mcc": [0.80, 0.82, 0.78, 0.84, 0.81]
+  }
 }
+```
 
 The proposed method and every baseline should contain results from the same number of independent runs.
 
-Output Files
+---
+
+## Output Files
 
 For each random seed, the implementation creates a separate result directory.
 
 Example:
 
+```text
 dual_agent_ddos_results/
 │
 ├── run_settings.json
@@ -586,42 +676,48 @@ dual_agent_ddos_results/
 │   └── ...
 │
 └── paired_statistics_holm.json
-model.pt
+```
+
+### `model.pt`
 
 Contains:
 
-trained LSTM-MLP detector,
-Agent 1 policy network,
-Agent 1 value network,
-Agent 2 policy network,
-Agent 2 value network,
-hyperparameter configuration,
-feature names,
-fixed implementation settings.
-preprocessor.joblib
+- trained LSTM-MLP detector,
+- Agent 1 policy network,
+- Agent 1 value network,
+- Agent 2 policy network,
+- Agent 2 value network,
+- hyperparameter configuration,
+- feature names,
+- fixed implementation settings.
 
-Contains the preprocessing transformations fitted exclusively on the training data.
+### `preprocessor.joblib`
 
-metrics.json
+Contains preprocessing transformations fitted exclusively on the training data.
+
+### `metrics.json`
 
 Contains final test-set metrics for the corresponding independent run.
 
-training_history.json
+### `training_history.json`
 
 Stores training statistics across epochs.
 
-best_config.json
+### `best_config.json`
 
 Stores the hyperparameter configuration identified by Homotopy-BOHB.
 
-aggregate_metrics.json
+### `aggregate_metrics.json`
 
 Contains mean and standard deviation across independent experimental runs.
 
-Important Command-Line Options
+---
 
-Some important options include:
+## Important Command-Line Options
 
+Important options include:
+
+```text
 --dataset
 --data-path
 --label-column
@@ -633,9 +729,11 @@ Some important options include:
 --baseline-results
 --cicflowmeter-command
 --device
+```
 
-Additional arguments expose methodological settings whose precise values may depend on the experimental configuration:
+Additional methodological settings can also be controlled:
 
+```text
 --initial-labeled-fraction
 --clip-lower-quantile
 --clip-upper-quantile
@@ -655,45 +753,57 @@ Additional arguments expose methodological settings whose precise values may dep
 --bohb-eta
 --lime-num-samples
 --lime-kernel-width
+```
 
-To view all available options:
+View all available options with:
 
+```bash
 python dual_agent_er_trpo_ddos.py --help
-Reproducibility
+```
+
+---
+
+## Reproducibility
 
 The implementation includes reproducibility controls for:
 
-Python random number generation,
-NumPy,
-PyTorch CPU execution,
-PyTorch CUDA execution,
-deterministic PyTorch operations when supported,
-reproducible dataset splitting,
-and reproducible DataLoader shuffling.
+- Python random number generation,
+- NumPy,
+- PyTorch CPU execution,
+- PyTorch CUDA execution,
+- deterministic PyTorch operations when supported,
+- reproducible dataset splitting,
+- and reproducible DataLoader shuffling.
 
 Multiple independent random seeds can be evaluated through the command line.
 
-Prevention of Data Leakage
+---
+
+## Prevention of Data Leakage
 
 The implementation explicitly separates:
 
+```text
 Training Set
 Validation Set
 Test Set
+```
 
-The test set is not used during model training, active learning, reward calculation, feature selection, or hyperparameter optimization.
+The **test set is not used during model training, active learning, reward calculation, feature selection, or hyperparameter optimization**.
 
 The validation set is used for:
 
-Active Learning reward evaluation,
-feature-selection reward evaluation,
-BOHB configuration selection.
+- Active Learning reward evaluation,
+- feature-selection reward evaluation,
+- BOHB configuration selection.
 
 The test set is accessed only during the final evaluation stage.
 
 Preprocessing transformations are estimated using training data only.
 
-Implementation Assumptions
+---
+
+## Implementation Assumptions
 
 Some low-level implementation details required for executable software are not explicitly specified in the manuscript.
 
@@ -701,112 +811,131 @@ The implementation therefore exposes these settings rather than deriving them fr
 
 Examples include:
 
-initial labeled-data fraction,
-exact percentile clipping thresholds,
-LSTM hidden dimension,
-policy-network hidden dimension,
-value-network hidden dimension,
-discount factor,
-n-step horizon,
-KL trust-region radius,
-conjugate-gradient iterations,
-conjugate-gradient damping,
-line-search settings,
-number of Homotopy stages,
-and LIME perturbation settings.
+- initial labeled-data fraction,
+- exact percentile clipping thresholds,
+- LSTM hidden dimension,
+- policy-network hidden dimension,
+- value-network hidden dimension,
+- discount factor,
+- n-step horizon,
+- KL trust-region radius,
+- conjugate-gradient iterations,
+- conjugate-gradient damping,
+- line-search settings,
+- number of Homotopy stages,
+- and LIME perturbation settings.
 
 These choices are clearly separated from quantities selected through the proposed optimization procedure.
 
-Reported results from the manuscript are not used as computational inputs.
+Reported results from the manuscript are **not used as computational inputs**.
 
-Computational Considerations
+---
+
+## Computational Considerations
 
 The full methodology is computationally demanding.
 
 The major training costs originate from:
 
-LSTM-MLP forward and backward computation,
-repeated ER-TRPO policy optimization,
-conjugate-gradient trust-region updates,
-repeated validation during Active Learning,
-LIME perturbation-based explanations,
-detector updates following newly annotated samples,
-and multi-stage Homotopy-BOHB optimization.
+- LSTM-MLP forward and backward computation,
+- repeated ER-TRPO policy optimization,
+- conjugate-gradient trust-region updates,
+- repeated validation during Active Learning,
+- LIME perturbation-based explanations,
+- detector updates following newly annotated samples,
+- and multi-stage Homotopy-BOHB optimization.
 
 For initial debugging, a smaller subset can be used:
 
+```bash
 --max-rows 10000
+```
 
-For example:
+Example:
 
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset kddcup99 \
     --data-path ./data/kddcup99 \
     --max-rows 10000
+```
 
 This option is intended for implementation testing and should not replace the full dataset in final experimental reproduction.
 
-Hardware Acceleration
+---
+
+## Hardware Acceleration
 
 CUDA is automatically used when available.
 
-A specific device can also be selected manually:
+Use GPU explicitly:
 
+```bash
 --device cuda
+```
 
-or
+Use CPU explicitly:
 
+```bash
 --device cpu
+```
 
 Example:
 
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset cicddos \
     --data-path ./data/cicddos \
     --device cuda
-Methodological Components Implemented
+```
 
-The current implementation includes:
+---
 
- Dataset loading
- Duplicate removal
- Incomplete-record filtering
- Train/validation/test splitting
- Training-only preprocessing
- Percentile clipping
- One-hot encoding
- Min-Max normalization
- LSTM representation learning
- MLP feature scoring
- Dual-agent reinforcement learning
- Active Learning
- Class-centroid affinity computation
- Entropy-based sample uncertainty
- Adaptive uncertainty threshold
- Annotation-cost-aware reward
- Sequential feature selection
- LIME feature attribution
- Feature-subset complexity penalty
- Validation-performance reward
- Class-frequency-aware classification reward
- TRPO policy optimization
- Multi-step returns
- Entropy regularization
- KL-divergence constraint
- Conjugate-gradient optimization
- Backtracking line search
- Homotopy continuation
- BOHB hyperparameter optimization
- Repeated independent runs
- Binary classification metrics
- Statistical testing
- Model persistence
- Preprocessor persistence
- Experimental-result reporting
-Reproducing an Experiment
+## Methodological Components Implemented
+
+- [x] Dataset loading
+- [x] Duplicate removal
+- [x] Incomplete-record filtering
+- [x] Train/validation/test splitting
+- [x] Training-only preprocessing
+- [x] Percentile clipping
+- [x] One-hot encoding
+- [x] Min-Max normalization
+- [x] LSTM representation learning
+- [x] MLP feature scoring
+- [x] Dual-agent reinforcement learning
+- [x] Active Learning
+- [x] Class-centroid affinity computation
+- [x] Entropy-based sample uncertainty
+- [x] Adaptive uncertainty threshold
+- [x] Annotation-cost-aware reward
+- [x] Sequential feature selection
+- [x] LIME feature attribution
+- [x] Feature-subset complexity penalty
+- [x] Validation-performance reward
+- [x] Class-frequency-aware classification reward
+- [x] TRPO policy optimization
+- [x] Multi-step returns
+- [x] Entropy regularization
+- [x] KL-divergence constraint
+- [x] Conjugate-gradient optimization
+- [x] Backtracking line search
+- [x] Homotopy continuation
+- [x] BOHB hyperparameter optimization
+- [x] Repeated independent runs
+- [x] Binary classification metrics
+- [x] Statistical testing
+- [x] Model persistence
+- [x] Preprocessor persistence
+- [x] Experimental-result reporting
+
+---
+
+## Reproducing an Experiment
 
 A typical complete experiment can be executed as follows:
 
+```bash
 python dual_agent_er_trpo_ddos.py \
     --dataset cicddos \
     --data-path ./data/cicddos \
@@ -814,66 +943,82 @@ python dual_agent_er_trpo_ddos.py \
     --seeds 42,123,2024,3407,5189 \
     --device cuda \
     --output-dir ./results/cicddos
+```
 
 The program will:
 
-load the dataset,
-remove invalid records,
-generate training, validation, and test partitions,
-fit preprocessing transformations using training data,
-construct labeled and unlabeled training pools,
-perform Homotopy-guided BOHB optimization,
-initialize the optimized dual-agent architecture,
-train Agent 2,
-exchange detector representations and predictions with Agent 1,
-perform adaptive sample acquisition,
-update the labeled pool,
-perform LIME-guided feature selection,
-optimize both policies using ER-TRPO,
-train the final configuration,
-evaluate the untouched test set,
-save the trained models and preprocessing pipeline,
-and report the final metrics.
-Citation
+1. load the dataset,
+2. remove invalid records,
+3. generate training, validation, and test partitions,
+4. fit preprocessing transformations using training data,
+5. construct labeled and unlabeled training pools,
+6. perform Homotopy-guided BOHB optimization,
+7. initialize the optimized dual-agent architecture,
+8. train Agent 2,
+9. exchange detector representations and predictions with Agent 1,
+10. perform adaptive sample acquisition,
+11. update the labeled pool,
+12. perform LIME-guided feature selection,
+13. optimize both policies using ER-TRPO,
+14. train the final configuration,
+15. evaluate the untouched test set,
+16. save the trained models and preprocessing pipeline,
+17. and report the final metrics.
+
+---
+
+## Citation
 
 If this repository is used in academic research, please cite the associated manuscript.
 
+```bibtex
 @article{dual_agent_er_trpo_ddos,
   title   = {An Intelligent Dual-Agent Reinforcement Learning Framework for DDoS Attack Detection},
   author  = {Authors},
   journal = {Journal},
   year    = {2026}
 }
+```
 
 The BibTeX entry should be updated with the final publication metadata after publication.
 
-Paper
+---
 
-Title:
-An Intelligent Dual-Agent Reinforcement Learning Framework for DDoS Attack Detection
+## Paper
+
+**Title:**  
+*An Intelligent Dual-Agent Reinforcement Learning Framework for DDoS Attack Detection*
 
 The framework combines:
 
-Active Learning + LSTM/MLP + LIME + Imbalance-Aware Reinforcement Learning + ER-TRPO + Multi-Step Returns + Homotopy-BOHB
+> **Active Learning + LSTM/MLP + LIME + Imbalance-Aware Reinforcement Learning + ER-TRPO + Multi-Step Returns + Homotopy-BOHB**
 
 for adaptive DDoS detection.
 
-License
+---
+
+## License
 
 A license should be added before public distribution of the repository.
 
-For open academic software, commonly used options include:
+Common options for academic software include:
 
-MIT License
-BSD 3-Clause License
-Apache License 2.0
+- MIT License
+- BSD 3-Clause License
+- Apache License 2.0
 
 The selected license should be consistent with the intended use and publication requirements.
 
-Contact
+---
 
-For questions regarding the methodology, implementation, or experimental reproduction, please use the repository Issues section.
+## Contact
+
+For questions regarding the methodology, implementation, or experimental reproduction, please use the repository **Issues** section.
+
+---
 
 <div align="center">
-Dual-Agent ER-TRPO for Adaptive and Interpretable DDoS Detection
-</div> ```
+
+### Dual-Agent ER-TRPO for Adaptive and Interpretable DDoS Detection
+
+</div>
